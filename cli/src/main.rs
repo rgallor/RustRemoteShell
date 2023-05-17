@@ -3,20 +3,16 @@ use std::ops::Deref;
 use clap::{Parser, Subcommand};
 
 use color_eyre::Result;
-use shellwords;
-
-// use the library containing the rust remote shell functions
-use rust_remote_shell;
 
 /// Shell CLI
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[clap(version, about)]
 struct Cli {
     /// Device
-    #[arg(short, long, required = true,  value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[clap(short, long, required = true,  value_parser = clap::builder::NonEmptyStringValueParser::new())]
     device: String, // not an Option<String> because the device id/name is required
 
-    #[command(subcommand)]
+    #[clap(subcommand)]
     command: Commands,
 }
 

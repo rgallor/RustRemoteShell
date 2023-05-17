@@ -21,25 +21,6 @@ pub enum ShellError {
     WrongOutConversion(#[from] FromUtf8Error),
 }
 
-/*
-
-fn main() {
-    todo!();
-
-    // Read the input args and take the command
-    let args = env::args();
-    let cmd = cmd_from_input(args).map_err(|e| eprintln!("Error: {:?}", e));
-
-    // Call function to execute the input command and save its output
-    match execute_cmd(&cmd) {
-        // print output command
-        Ok(cmd_out) => println!("Command output: {}", cmd_out),
-        Err(e) => eprintln!("Error: {:?}", e),
-    }
-}
-
-*/
-
 fn execute_cmd<S>(cmd: &[S]) -> Result<process::Output, ShellError>
 where
     S: AsRef<OsStr>,
@@ -66,7 +47,7 @@ where
     // If the error states that the command does not exists, throw WrongCommand(cmd.split(' ').first().unwrap())
     let cmd_out = execute_cmd(cmd)?;
 
-    Ok(std::string::String::from_utf8(cmd_out.stdout)
+    std::string::String::from_utf8(cmd_out.stdout)
         // if the conversion from UTF8 to String goes wrong, return an error
-        .map_err(|e| ShellError::WrongOutConversion(e))?)
+        .map_err(ShellError::WrongOutConversion)
 }
