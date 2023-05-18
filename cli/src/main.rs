@@ -4,14 +4,9 @@ use clap::{Parser, Subcommand};
 
 use color_eyre::Result;
 
-/// Shell CLI
+/// CLI for a rust remote shell
 #[derive(Debug, Parser)]
-#[clap(version, about)]
 struct Cli {
-    /// Device
-    #[clap(short, long, required = true,  value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    device: String, // not an Option<String> because the device id/name is required
-
     #[clap(subcommand)]
     command: Commands,
 }
