@@ -21,10 +21,6 @@ struct Cli {
 enum Commands {
     /// Execute a command
     Command { cmd: String },
-    // Authenticate device
-    // Authenticate { token: String },
-    // Logout device
-    // Logout,
 }
 
 fn main() -> Result<()> {
@@ -42,10 +38,7 @@ fn main() -> Result<()> {
 
             let cmd_out = rust_remote_shell::cmd_from_input(cmd.deref())?;
             println!("Command output: {}", cmd_out);
-        } // Commands::Authenticate { token } => {
-          //     println!("Authenticate device {}", cli.device)
-          // }
-          // Commands::Logout => { ACTIONS TO LOG OUT }
+        }
     }
 
     Ok(())
