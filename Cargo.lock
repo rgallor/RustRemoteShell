@@ -144,6 +144,7 @@ dependencies = [
  "color-eyre",
  "rust-remote-shell",
  "shellwords",
+ "tokio",
 ]
 
 [[package]]
@@ -628,6 +629,7 @@ name = "rust-remote-shell"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "shellwords",
  "thiserror",
  "tokio",
  "tokio-tungstenite",

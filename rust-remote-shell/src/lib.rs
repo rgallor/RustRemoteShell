@@ -1,7 +1,10 @@
-use futures_util::StreamExt; // future, TryStreamExt
+use futures_util::{future, StreamExt, TryStreamExt};
 use std::io;
 use std::net::SocketAddr;
-//use std::os::unix::prelude::OsStrExt;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tokio_tungstenite::tungstenite::Message; // future, TryStreamExt
+                                             //use std::os::unix::prelude::OsStrExt;
 use std::ffi::OsStr; // , ffi::OsString, collections::VecDeque,
 use std::process;
 use std::string::FromUtf8Error;
@@ -55,8 +58,6 @@ where
         .map_err(ShellError::WrongOutConversion)
 }
 
-// type Command = OsString;
-
 #[derive(Error, Debug)]
 pub enum DeviceServerError {
     #[error("Failed to bind on port {0}")]
@@ -65,6 +66,14 @@ pub enum DeviceServerError {
     PeerAddrError,
     #[error("Error during the websocket handshake occurred")]
     WebSocketHandshakeError,
+    #[error("Error while reading the shell command from websocket")]
+    ReadCommandError,
+    #[error("Shell error: {0}")]
+    DeviceShellError(#[from] ShellError),
+    #[error("Error marshaling to UTF8")]
+    Utf8Error(#[from] FromUtf8Error),
+    #[error("Trasport error from Tungstenite")]
+    Transport(#[from] tokio_tungstenite::tungstenite::Error),
 }
 
 pub struct DeviceServer {
@@ -87,43 +96,95 @@ impl DeviceServer {
 
         println!("Listening on: {}", self.addr);
 
+        // TODO
+        // Destrutturare self in modo tale da prendere un mutable reference alla lista di comandi
+        // Usare un mutex per passare la coda di comandi ad ogni handle_connection
+        // pass the queue of commands to each spawned task.
+
+        let (tx_err, mut rx_err) = tokio::sync::mpsc::channel::<DeviceServerError>(10);
+
+        let handles = Arc::new(Mutex::new(Vec::new()));
+        let handles_clone = Arc::clone(&handles);
+
         // accept a new connection
-        while let Ok((stream, _)) = socket.accept().await {
-            tokio::spawn(handle_connection(stream));
+        let handle_connections = tokio::spawn(async move {
+            while let Ok((stream, _)) = socket.accept().await {
+                let handle_single_connection = tokio::spawn(
+                    Self::handle_connection(stream, tx_err.clone()), // TODO: GESTIRE ERRORE
+                );
+                handles_clone.lock().await.push(handle_single_connection);
+            }
+        });
+
+        // join connections
+        if let Some(err) = rx_err.recv().await {
+            handle_connections.abort();
+            let _ = handle_connections.await; // TODO print error
+
+            for h in handles.lock().await.iter() {
+                h.abort();
+            }
+
+            return Err(err);
         }
 
         Ok(())
     }
-}
 
-// create a websocket connection and
-async fn handle_connection(stream: TcpStream) -> Result<(), DeviceServerError> {
-    let addr = stream
-        .peer_addr()
-        .map_err(|_| DeviceServerError::PeerAddrError)?;
+    // create a websocket connection and
+    async fn handle_connection(
+        stream: TcpStream,
+        _tx_err: tokio::sync::mpsc::Sender<DeviceServerError>,
+    ) -> Result<(), DeviceServerError> {
+        let addr = stream
+            .peer_addr()
+            .map_err(|_| DeviceServerError::PeerAddrError)?;
 
-    // create a WebSocket connection
-    let try_web_socket_stream = tokio_tungstenite::accept_async(stream).await;
-    let web_socket_stream =
-        try_web_socket_stream.map_err(|_| DeviceServerError::WebSocketHandshakeError)?;
+        // create a WebSocket connection
+        let try_web_socket_stream = tokio_tungstenite::accept_async(stream).await;
+        let web_socket_stream =
+            try_web_socket_stream.map_err(|_| DeviceServerError::WebSocketHandshakeError)?;
 
-    println!("New WebSocket connection created: {}", addr);
+        println!("New WebSocket connection created: {}", addr);
 
-    // separate ownership between receiving and writing part
-    let (_write, _read) = web_socket_stream.split();
+        // separate ownership between receiving and writing part
+        let (_write, read) = web_socket_stream.split();
 
-    // 0. decomment imports & type Command & remove _
-    // 1. read the received command
-    // 2. convert it from a Vec<u8> into a OsString --> OsStr::from_bytes(&Vec<u8>).to_owned()
-    // 3. send the output to the client (either Ok or ShellError)
-    // 4. IMPLEMENT CLIENT
+        // Read the received command
+        read.map_err(DeviceServerError::Transport)
+            .and_then(|msg| {
+                let cmd = match msg {
+                    // convert the message from a Vec<u8> into a OsString --> OsStr::from_bytes(&Vec<u8>).to_owned()
+                    Message::Text(t) => Ok(t),
+                    Message::Binary(v) => {
+                        String::from_utf8(v).map_err(DeviceServerError::Utf8Error)
+                    }
+                    _ => Err(DeviceServerError::ReadCommandError),
+                };
+                future::ready(cmd)
+            })
+            .try_for_each(|cmd| async move {
+                // convert the command into the correct format
+                let cmd = shellwords::split(&cmd)
+                    .map_err(|_| DeviceServerError::DeviceShellError(ShellError::MalformedInput))?;
 
-    /*
-    read.try_filter(|msg| future::ready(msg.is_text() || msg.is_binary()))
-        .forward(write)
-        .await
-        .expect("Failed to forward messages")
-     */
+                // compute the command
+                let cmd_out = cmd_from_input(&cmd).map_err(DeviceServerError::DeviceShellError)?; // TODO: MAKE THIS AN ASYNC FUNCTION
+                println!("Command output: {}", cmd_out);
 
-    Ok(())
+                // WE SHOULD COMPUTE THE OUTPUT AND SEND IT TO THE CLIENT, NOOT PRINTING IT
+
+                /*
+                read.try_filter(|msg| future::ready(msg.is_text() || msg.is_binary()))
+                    .forward(write)
+                    .await
+                    .expect("Failed to forward messages")
+                 */
+
+                Ok(())
+            })
+            .await?;
+
+        Ok(())
+    }
 }
