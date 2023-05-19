@@ -27,7 +27,7 @@ pub enum ShellError {
     WrongOutConversion(#[from] FromUtf8Error),
 }
 
-fn execute_cmd<S>(cmd: &[S]) -> Result<process::Output, ShellError>
+async fn execute_cmd<S>(cmd: &[S]) -> Result<process::Output, ShellError>
 where
     S: AsRef<OsStr>,
 {
@@ -43,7 +43,7 @@ where
         })
 }
 
-pub fn cmd_from_input<S>(cmd: &[S]) -> Result<String, ShellError>
+pub async fn cmd_from_input<S>(cmd: &[S]) -> Result<String, ShellError>
 where
     S: AsRef<OsStr>,
 {
@@ -51,7 +51,7 @@ where
 
     // try executing the command.
     // If the error states that the command does not exists, throw WrongCommand(cmd.split(' ').first().unwrap())
-    let cmd_out = execute_cmd(cmd)?;
+    let cmd_out = execute_cmd(cmd).await?;
 
     std::string::String::from_utf8(cmd_out.stdout)
         // if the conversion from UTF8 to String goes wrong, return an error
@@ -74,6 +74,14 @@ pub enum DeviceServerError {
     Utf8Error(#[from] FromUtf8Error),
     #[error("Trasport error from Tungstenite")]
     Transport(#[from] tokio_tungstenite::tungstenite::Error),
+}
+
+impl DeviceServerError {
+    fn is_fatal(&self) -> bool {
+        // distinguish between fatal (cause server failure) and non-fatal error
+        // maatch between different kind of errors.
+        todo!()
+    }
 }
 
 pub struct DeviceServer {
@@ -112,6 +120,7 @@ impl DeviceServer {
                 let handle_single_connection = tokio::spawn(
                     Self::handle_connection(stream, tx_err.clone()), // TODO: GESTIRE ERRORE
                 );
+
                 handles_clone.lock().await.push(handle_single_connection);
             }
         });
@@ -134,8 +143,16 @@ impl DeviceServer {
     // create a websocket connection and
     async fn handle_connection(
         stream: TcpStream,
-        _tx_err: tokio::sync::mpsc::Sender<DeviceServerError>,
-    ) -> Result<(), DeviceServerError> {
+        tx_err: tokio::sync::mpsc::Sender<DeviceServerError>,
+    ) {
+        match Self::impl_handle_connection(stream).await {
+            Ok(_) => {}
+            Err(err) if err.is_fatal() => tx_err.send(err).await.expect("Error handler failure"),
+            Err(_) => todo!(),
+        }
+    }
+
+    async fn impl_handle_connection(stream: TcpStream) -> Result<(), DeviceServerError> {
         let addr = stream
             .peer_addr()
             .map_err(|_| DeviceServerError::PeerAddrError)?;
@@ -169,10 +186,12 @@ impl DeviceServer {
                     .map_err(|_| DeviceServerError::DeviceShellError(ShellError::MalformedInput))?;
 
                 // compute the command
-                let cmd_out = cmd_from_input(&cmd).map_err(DeviceServerError::DeviceShellError)?; // TODO: MAKE THIS AN ASYNC FUNCTION
+                let cmd_out = cmd_from_input(&cmd)
+                    .await
+                    .map_err(DeviceServerError::DeviceShellError)?; // TODO: MAKE THIS AN ASYNC FUNCTION
                 println!("Command output: {}", cmd_out);
 
-                // WE SHOULD COMPUTE THE OUTPUT AND SEND IT TO THE CLIENT, NOOT PRINTING IT
+                // WE SHOULD COMPUTE THE OUTPUT AND SEND IT TO THE CLIENT, NOT PRINTING IT
 
                 /*
                 read.try_filter(|msg| future::ready(msg.is_text() || msg.is_binary()))

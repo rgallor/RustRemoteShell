@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
             let cmd = shellwords::split(cmd.trim())
                 .map_err(|_| rust_remote_shell::ShellError::MalformedInput)?;
 
-            let cmd_out = rust_remote_shell::cmd_from_input(cmd.deref())?;
+            let cmd_out = rust_remote_shell::cmd_from_input(cmd.deref()).await?;
             println!("Command output: {}", cmd_out);
         }
         Commands::Listener { addr } => {
