@@ -3,7 +3,9 @@ use std::{net::SocketAddr, ops::Deref};
 use clap::{Parser, Subcommand};
 
 use color_eyre::Result;
-use rust_remote_shell::DeviceServer;
+use rust_remote_shell::{DeviceServer, SenderClient};
+use tracing::Level;
+use tracing_subscriber::FmtSubscriber;
 
 /// CLI for a rust remote shell
 #[derive(Debug, Parser)]
@@ -20,12 +22,19 @@ enum Commands {
     /// Make the device  listen on a specific IP and port
     Listener { addr: SocketAddr },
     /// Create a client capable of sending command to a Listener
-    Sender { addr: SocketAddr },
+    Sender { listener_addr: url::Url },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
+
+    // define a subscriber for logging purposes
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(Level::TRACE)
+        .finish();
+
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
     let cli = Cli::parse();
 
@@ -44,9 +53,9 @@ async fn main() -> Result<()> {
             let device_server = DeviceServer::new(*addr);
             device_server.listen().await?;
         }
-        Commands::Sender { addr: _ } => {
-            todo!();
-            //let sender_client = SenderClient::new(addr);
+        Commands::Sender { listener_addr } => {
+            let sender_client = SenderClient::new(listener_addr.clone());
+            sender_client.connect().await?;
         }
     }
 
