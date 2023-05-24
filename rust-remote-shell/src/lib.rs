@@ -11,7 +11,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::process;
 use tokio::{io::AsyncWriteExt, sync::Mutex};
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
-use tracing::{error, info, instrument};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tracing::{error, info, instrument, warn};
 use url::Url;
 
 #[derive(Error, Debug)]
@@ -30,36 +31,42 @@ pub enum ShellError {
     WrongOutConversion(#[from] FromUtf8Error),
 }
 
-async fn execute_cmd<S>(cmd: &[S]) -> Result<std::process::Output, ShellError>
-where
-    S: AsRef<OsStr>,
-{
-    let mut cmd_iter = cmd.iter();
-    let cmd_to_exec = cmd_iter.next().ok_or(ShellError::EmptyCommand)?;
+pub struct CommandHandler;
 
-    process::Command::new(cmd_to_exec)
-        .args(cmd_iter)
-        .output()
-        .await
-        .map_err(|e| ShellError::WrongCommand {
-            cmd: cmd_to_exec.as_ref().to_string_lossy().to_string(),
-            error: e,
-        })
-}
+impl CommandHandler {
+    fn new() -> Self {
+        Self
+        // TODO: open a remote shell (to the input IP addr)
+    }
 
-pub async fn cmd_from_input<S>(cmd: &[S]) -> Result<String, ShellError>
-where
-    S: AsRef<OsStr>,
-{
-    // before calling this function the binary should ensure that the input in in the correct sintactic format
+    pub async fn execute(&self, cmd: String) -> Result<String, ShellError> {
+        // convert the command into the correct format
+        let cmd = shellwords::split(&cmd).map_err(|_| ShellError::MalformedInput)?;
 
-    // try executing the command.
-    // If the error states that the command does not exists, throw WrongCommand(cmd.split(' ').first().unwrap())
-    let cmd_out = execute_cmd(cmd).await?;
+        // try executing the command.
+        let cmd_out = self.inner_execute(&cmd).await?;
 
-    std::string::String::from_utf8(cmd_out.stdout)
-        // if the conversion from UTF8 to String goes wrong, return an error
-        .map_err(ShellError::WrongOutConversion)
+        std::string::String::from_utf8(cmd_out.stdout)
+            // if the conversion from UTF8 to String goes wrong, return an error
+            .map_err(ShellError::WrongOutConversion)
+    }
+
+    async fn inner_execute<S>(&self, cmd: &[S]) -> Result<std::process::Output, ShellError>
+    where
+        S: AsRef<OsStr>,
+    {
+        let mut cmd_iter = cmd.iter();
+        let cmd_to_exec = cmd_iter.next().ok_or(ShellError::EmptyCommand)?;
+
+        process::Command::new(cmd_to_exec)
+            .args(cmd_iter)
+            .output()
+            .await
+            .map_err(|e| ShellError::WrongCommand {
+                cmd: cmd_to_exec.as_ref().to_string_lossy().to_string(),
+                error: e,
+            })
+    }
 }
 
 #[derive(Error, Debug)]
@@ -76,6 +83,8 @@ pub enum DeviceServerError {
     Utf8Error(#[from] FromUtf8Error),
     #[error("Trasport error from Tungstenite")]
     Transport(#[from] tokio_tungstenite::tungstenite::Error),
+    #[error("Error while precessing the shell command")]
+    ShellError(#[from] ShellError),
     #[error("Close websocket connection")]
     CloseWebsocket,
 }
@@ -116,7 +125,7 @@ impl DeviceServer {
             }
         });
 
-        // join connections
+        // join connections and handle errors
         if let Some(err) = rx_err.recv().await {
             // terminate all connections
             handle_connections.abort();
@@ -137,7 +146,10 @@ impl DeviceServer {
     async fn handle_connection(stream: TcpStream, tx_err: TxErrorType) {
         match Self::impl_handle_connection(stream).await {
             Ok(_) => {}
-            Err(DeviceServerError::CloseWebsocket) => info!("Websocket connection closed"), // TODO: check that the connection is effectively closed on the server-side (not only on the client-side)
+            Err(DeviceServerError::CloseWebsocket) => {
+                info!("Websocket connection closed");
+                // TODO: check that the connection is effectively closed on the server-side (not only on the client-side)
+            }
             Err(err) => {
                 error!("Fatal error occurred: {}", err);
                 tx_err.send(err).await.expect("Error handler failure");
@@ -165,29 +177,27 @@ impl DeviceServer {
         read.map_err(DeviceServerError::Transport)
             .and_then(|msg| {
                 let cmd = match msg {
-                    // convert the message from a Vec<u8> into a OsString --> OsStr::from_bytes(&Vec<u8>).to_owned()
-                    Message::Text(t) => Ok(t),
+                    // convert the message from a Vec<u8> into a OsString
                     Message::Binary(v) => {
                         String::from_utf8(v).map_err(DeviceServerError::Utf8Error)
                     }
-                    Message::Close(_) => Err(DeviceServerError::CloseWebsocket),
+                    Message::Close(_) => Err(DeviceServerError::CloseWebsocket), // the client closed the connection
                     _ => Err(DeviceServerError::ReadCommand),
                 };
                 info!("Received command from the client");
                 future::ready(cmd)
             })
             .and_then(|cmd| async move {
-                // convert the command into the correct format
-                let cmd =
-                    shellwords::split(&cmd).unwrap_or(vec!["Malformed command.\n".to_string()]);
+                // define a command handler
+                let cmd_handler = CommandHandler::new();
 
-                // compute the command
-                let cmd_out = cmd_from_input(&cmd)
-                    .await
-                    .unwrap_or(String::from("Incorrect command.\n"));
+                // execute the command and eventually return the error
+                let cmd_out = cmd_handler.execute(cmd).await.unwrap_or_else(|err| {
+                    warn!("Shell error: {}", err);
+                    format!("Shell error: {}\n", err)
+                });
 
                 info!("Send command output to the client");
-
                 Ok(Message::Binary(cmd_out.as_bytes().to_vec()))
             })
             .forward(write.sink_map_err(DeviceServerError::Transport))
@@ -195,12 +205,6 @@ impl DeviceServer {
 
         Ok(())
     }
-}
-
-#[derive(Debug)]
-pub struct SenderClient {
-    listener_url: Url,
-    // id: usize,
 }
 
 #[derive(Error, Debug)]
@@ -223,20 +227,44 @@ pub enum SenderClientError {
     },
 }
 
+#[derive(Debug)]
+pub struct SenderClient {
+    listener_url: Url,
+    ws_stream: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+}
+
 impl SenderClient {
     pub fn new(listener_url: Url) -> Self {
         info!("Create client");
-        Self { listener_url }
+        Self {
+            listener_url,
+            ws_stream: None,
+        }
     }
 
     #[instrument(skip(self))]
-    pub async fn connect(&self) -> Result<(), SenderClientError> {
+    pub async fn connect(&mut self) -> Result<(), SenderClientError> {
         // Websocket connection to an existing server
-        let (mut ws_stream, _) = connect_async(self.listener_url.clone())
+        let (ws_stream, _) = connect_async(self.listener_url.clone())
             .await
             .map_err(SenderClientError::WebSocketConnect)?;
 
+        self.ws_stream = Some(ws_stream);
+
         info!("WebSocket handshake has been successfully completed");
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
+    pub async fn send(&mut self) -> Result<(), SenderClientError> {
+        let SenderClient {
+            listener_url: _,
+            ws_stream,
+        } = self;
+
+        let ws_stream = ws_stream
+            .as_mut()
+            .expect("expect existing websocket stream");
 
         let stdin = tokio::io::stdin();
         let mut reader = BufReader::new(stdin);
@@ -269,19 +297,17 @@ impl SenderClient {
                 .expect("error while sending a command through websocket to the server");
 
             // read command shell output from the websocket
-            let msg = match ws_stream.next().await {
-                None => todo!(), // connection closed / server stops
-                Some(res) => res.map_err(|err| SenderClientError::TungsteniteReadData { err })?,
+            if let Some(res) = ws_stream.next().await {
+                let data = res
+                    .map_err(|err| SenderClientError::TungsteniteReadData { err })?
+                    .into_data();
+
+                stdout
+                    .write(&data)
+                    .await
+                    .map_err(|err| SenderClientError::IOWrite { err })?;
+                stdout.flush().await.expect("writing stdout");
             };
-
-            let data = msg.into_data();
-            info!("Returned cmd out to the Client");
-
-            stdout
-                .write(&data)
-                .await
-                .map_err(|err| SenderClientError::IOWrite { err })?;
-            stdout.flush().await.expect("writing stdout");
         }
     }
 }
