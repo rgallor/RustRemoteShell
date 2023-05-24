@@ -76,6 +76,8 @@ pub enum DeviceServerError {
     Utf8Error(#[from] FromUtf8Error),
     #[error("Trasport error from Tungstenite")]
     Transport(#[from] tokio_tungstenite::tungstenite::Error),
+    #[error("Close websocket connection")]
+    CloseWebsocket,
 }
 
 type TxErrorType = tokio::sync::mpsc::Sender<DeviceServerError>;
@@ -135,8 +137,8 @@ impl DeviceServer {
     async fn handle_connection(stream: TcpStream, tx_err: TxErrorType) {
         match Self::impl_handle_connection(stream).await {
             Ok(_) => {}
+            Err(DeviceServerError::CloseWebsocket) => info!("Websocket connection closed"), // TODO: check that the connection is effectively closed on the server-side (not only on the client-side)
             Err(err) => {
-                // TODO: fare in modo che quando un client interrompa la connessione, il server non termini
                 error!("Fatal error occurred: {}", err);
                 tx_err.send(err).await.expect("Error handler failure");
             }
@@ -168,6 +170,7 @@ impl DeviceServer {
                     Message::Binary(v) => {
                         String::from_utf8(v).map_err(DeviceServerError::Utf8Error)
                     }
+                    Message::Close(_) => Err(DeviceServerError::CloseWebsocket),
                     _ => Err(DeviceServerError::ReadCommand),
                 };
                 info!("Received command from the client");
@@ -220,16 +223,6 @@ pub enum SenderClientError {
     },
 }
 
-// impl SenderClientError {
-//     fn handle_error(self) {
-//         todo!()
-//         // gracefully stop the client in case of errors
-//         // cases to handle:
-//         // 1. send a wrong command suddenly stops the client
-//         // 2. ...
-//     }
-// }
-
 impl SenderClient {
     pub fn new(listener_url: Url) -> Self {
         info!("Create client");
@@ -258,7 +251,18 @@ impl SenderClient {
                 .read_line(&mut cmd)
                 .await
                 .map_err(SenderClientError::IORead)?;
-            info!("Send cmd \"{}\" to the server", cmd);
+
+            // check if the command is exit. Eventually, close the connection
+            if cmd.starts_with("exit") {
+                ws_stream
+                    .close(None)
+                    .await
+                    .expect("Error while closing websocket connection");
+                info!("Closed websocket on client side");
+                break Ok(());
+            }
+
+            info!("Send command to the server");
             ws_stream
                 .send(Message::Binary(cmd.as_bytes().to_vec()))
                 .await
