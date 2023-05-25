@@ -44,7 +44,6 @@ async fn main() -> Result<()> {
         Commands::Sender { listener_addr } => {
             let mut sender_client = SenderClient::new(listener_addr.clone());
             sender_client.connect().await?;
-            sender_client.send().await?;
         }
     }
 

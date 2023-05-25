@@ -4,11 +4,16 @@ use std::net::SocketAddr;
 use std::string::FromUtf8Error;
 use std::sync::Arc;
 
+use futures::stream::SplitSink;
 use futures::{future, SinkExt, StreamExt, TryStreamExt};
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader, Stdin, Stdout};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process;
+use tokio::sync::mpsc::error::{SendError, TryRecvError};
+use tokio::sync::mpsc::{Sender, UnboundedReceiver};
+use tokio::sync::MutexGuard;
+use tokio::task::JoinHandle;
 use tokio::{io::AsyncWriteExt, sync::Mutex};
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -129,7 +134,11 @@ impl DeviceServer {
         if let Some(err) = rx_err.recv().await {
             // terminate all connections
             handle_connections.abort();
-            let _ = handle_connections.await;
+
+            match handle_connections.await {
+                Err(err) if !err.is_cancelled() => error!("Join failed: {}", err),
+                _ => {}
+            }
 
             for h in handles.lock().await.iter() {
                 h.abort();
@@ -219,27 +228,228 @@ pub enum SenderClientError {
         err: std::io::Error,
     },
     #[error("Error while trying to send the output of a command to the main task")]
-    SendOutput(#[from] tokio::sync::mpsc::error::SendError<Message>),
+    Channel(#[from] SendError<Message>),
     #[error("Error from Tungstenite while reading command")]
     TungsteniteReadData {
         #[source]
         err: tokio_tungstenite::tungstenite::Error,
     },
+    #[error("Server disconnected")]
+    Disconnected,
+}
+
+#[derive(Debug)]
+pub struct IOHandler {
+    stdout: Stdout,
+    reader: BufReader<Stdin>,
+    write: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+    tx_err: Sender<Result<(), SenderClientError>>,
+    buf_cmd: String,
+}
+
+impl IOHandler {
+    fn new(
+        write: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+        tx_err: Sender<Result<(), SenderClientError>>,
+    ) -> Self {
+        Self {
+            stdout: tokio::io::stdout(),
+            reader: BufReader::new(tokio::io::stdin()),
+            write,
+            tx_err,
+            buf_cmd: String::new(),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn read_stdin(&mut self) -> Result<(), SenderClientError> {
+        self.buf_cmd.clear();
+
+        // read a shell command into the stdin and send it to the server
+        self.reader
+            .read_line(&mut self.buf_cmd)
+            .await
+            .map_err(SenderClientError::IORead)?;
+
+        if self.check_exit() {
+            self.exit().await?;
+        }
+
+        Ok(())
+    }
+
+    #[instrument(skip_all)]
+    fn check_exit(&self) -> bool {
+        self.buf_cmd.starts_with("exit")
+    }
+
+    #[instrument(skip_all)]
+    async fn exit(&mut self) -> Result<(), SenderClientError> {
+        // check if the command is exit. Eventually, close the connection
+
+        self.write
+            .send(Message::Close(None))
+            .await
+            .expect("Error while closing websocket connection");
+        info!("Closed websocket on client side");
+
+        self.tx_err.send(Ok(())).await.expect("channel error");
+
+        Ok(()) // send Ok(()) to close the connection on client side
+               //break Ok(());
+    }
+
+    #[instrument(skip_all)]
+    async fn send_to_server(&mut self) -> Result<(), SenderClientError> {
+        info!("Send command to the server");
+        self.write
+            .send(Message::Binary(self.buf_cmd.as_bytes().to_vec()))
+            .await
+            .map_err(|err| SenderClientError::TungsteniteReadData { err })?;
+
+        info!("Command sent: {}", self.buf_cmd);
+
+        Ok(())
+    }
+
+    #[instrument(skip_all)]
+    async fn impl_write_stdout(&mut self, msg: Message) -> Result<(), SenderClientError> {
+        let data = msg.into_data();
+
+        self.stdout
+            .write(&data)
+            .await
+            .map_err(|err| SenderClientError::IOWrite { err })?;
+
+        self.stdout.flush().await.expect("writing stdout");
+
+        Ok(())
+    }
+
+    #[instrument(skip_all)]
+    pub async fn write_stdout(
+        &mut self,
+        rx: Arc<Mutex<UnboundedReceiver<Message>>>,
+    ) -> Result<(), SenderClientError> {
+        // check if there are command outputs stored in the channel. Eventually, print them to the stdout
+        let mut channel = rx.lock().await;
+
+        // wait to receive the first command output
+        let msg = channel.recv().await.unwrap();
+
+        self.impl_write_stdout(msg).await?;
+
+        self.empty_buffer(channel).await?;
+
+        Ok(())
+    }
+
+    async fn empty_buffer(
+        &mut self,
+        mut channel: MutexGuard<'_, UnboundedReceiver<Message>>,
+    ) -> Result<(), SenderClientError> {
+        loop {
+            match channel.try_recv() {
+                Ok(msg) => {
+                    self.impl_write_stdout(msg).await?;
+                }
+                Err(TryRecvError::Empty) => {
+                    // the channel is empty but the connection is still open
+                    break Ok(()); // TODO: check that Ok(()) is a good return value
+                }
+                Err(TryRecvError::Disconnected) => {
+                    unreachable!("the channel should not be dropped before the task is aborted")
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct SenderClient {
     listener_url: Url,
-    ws_stream: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
 }
 
 impl SenderClient {
     pub fn new(listener_url: Url) -> Self {
-        info!("Create client");
-        Self {
-            listener_url,
-            ws_stream: None,
+        Self { listener_url }
+    }
+
+    async fn read_write(
+        write: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+        rx: Arc<Mutex<UnboundedReceiver<Message>>>,
+        tx_err: Sender<Result<(), SenderClientError>>,
+    ) -> Result<(), SenderClientError> {
+        let mut iohandler = IOHandler::new(write, tx_err);
+
+        // read from stdin and, if messages are present on the channel (rx) print them to the stdout
+        loop {
+            iohandler.read_stdin().await?;
+            iohandler.send_to_server().await?;
+            iohandler.write_stdout(Arc::clone(&rx)).await?;
         }
+        /*
+        loop {
+            cmd.clear();
+            // read a shell command from the stdin and send it to the server
+            reader
+                .read_line(&mut cmd)
+                .await
+                .map_err(SenderClientError::IORead)?;
+
+            // check if the command is exit. Eventually, close the connection
+            if cmd.starts_with("exit") {
+                write
+                    .send(Message::Close(None))
+                    .await
+                    .expect("Error while closing websocket connection");
+                info!("Closed websocket on client side");
+                tx_err.send(Ok(())).await.expect("channel error"); // send Ok(()) to close the connection on client side
+                break Ok(());
+            }
+
+            info!("Send command to the server");
+            write
+                .send(Message::Binary(cmd.as_bytes().to_vec()))
+                .await
+                .expect("error while sending a command through websocket to the server");
+            info!("Command sent: {}", cmd);
+
+            // check if there are command outputs stored in the channel. Eventually, print them to the stdout
+            let mut channel = rx.lock().await;
+
+            let some = channel.recv().await.unwrap();
+            let data = some.into_data();
+
+            stdout
+                .write(&data)
+                .await
+                .map_err(|err| SenderClientError::IOWrite { err })?;
+            stdout.flush().await.expect("writing stdout");
+
+            // TODO: define function
+            loop {
+                match channel.try_recv() {
+                    Ok(cmd_out) => {
+                        let data = cmd_out.into_data();
+
+                        stdout
+                            .write(&data)
+                            .await
+                            .map_err(|err| SenderClientError::IOWrite { err })?;
+                        stdout.flush().await.expect("writing stdout");
+                    }
+                    Err(TryRecvError::Empty) => {
+                        // the channel is empty but the connection is still open
+                        break;
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        unreachable!("the channel should not be dropped before the task is aborted")
+                    }
+                }
+            }
+        }
+        */
     }
 
     #[instrument(skip(self))]
@@ -249,65 +459,82 @@ impl SenderClient {
             .await
             .map_err(SenderClientError::WebSocketConnect)?;
 
-        self.ws_stream = Some(ws_stream);
-
         info!("WebSocket handshake has been successfully completed");
-        Ok(())
-    }
 
-    #[instrument(skip(self))]
-    pub async fn send(&mut self) -> Result<(), SenderClientError> {
-        let SenderClient {
-            listener_url: _,
-            ws_stream,
-        } = self;
+        let (write, read) = ws_stream.split();
 
-        let ws_stream = ws_stream
-            .as_mut()
-            .expect("expect existing websocket stream");
+        let (tx_cmd_out, rx_cmd_out) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let rx_cmd_out = Arc::new(Mutex::new(rx_cmd_out));
+        let rx_cmd_out_clone = Arc::clone(&rx_cmd_out);
 
-        let stdin = tokio::io::stdin();
-        let mut reader = BufReader::new(stdin);
-        let mut cmd = String::new();
-        let mut stdout = tokio::io::stdout();
+        let (tx_err, mut rx_err) = tokio::sync::mpsc::channel::<Result<(), SenderClientError>>(1);
 
-        // loop to read a command from stdin, wait for its output and write it to stdout
-        loop {
-            cmd.clear();
-            // read a shell command into the stdin and send it to the server
-            reader
-                .read_line(&mut cmd)
-                .await
-                .map_err(SenderClientError::IORead)?;
+        // handle stdin and stdout
+        let handle_std_in_out =
+            tokio::spawn(Self::read_write(write, rx_cmd_out_clone, tx_err.clone()));
 
-            // check if the command is exit. Eventually, close the connection
-            if cmd.starts_with("exit") {
-                ws_stream
-                    .close(None)
-                    .await
-                    .expect("Error while closing websocket connection");
-                info!("Closed websocket on client side");
-                break Ok(());
+        let handle_read = tokio::spawn(async move {
+            let res = read
+                .map_err(|err| SenderClientError::TungsteniteReadData { err })
+                .try_for_each(|cmd_out| async {
+                    tx_cmd_out.send(cmd_out).map_err(SenderClientError::Channel)
+                })
+                .await;
+
+            if let Err(err) = res {
+                tx_err.send(Err(err)).await.expect("channel error");
             }
 
-            info!("Send command to the server");
-            ws_stream
-                .send(Message::Binary(cmd.as_bytes().to_vec()))
-                .await
-                .expect("error while sending a command through websocket to the server");
+            Ok(())
+        });
 
-            // read command shell output from the websocket
-            if let Some(res) = ws_stream.next().await {
-                let data = res
-                    .map_err(|err| SenderClientError::TungsteniteReadData { err })?
-                    .into_data();
+        let handles = vec![handle_std_in_out, handle_read];
 
-                stdout
-                    .write(&data)
-                    .await
-                    .map_err(|err| SenderClientError::IOWrite { err })?;
-                stdout.flush().await.expect("writing stdout");
-            };
+        match rx_err.recv().await.expect("channel error") {
+            Ok(()) => {
+                info!("Closing websocket connection");
+                Self::close(handles, rx_cmd_out).await
+            }
+            Err(err) => {
+                error!("Fatal error: {}", err);
+                Self::close(handles, rx_cmd_out).await
+            }
         }
+    }
+
+    #[instrument(skip_all)]
+    async fn close(
+        handles: Vec<JoinHandle<Result<(), SenderClientError>>>,
+        rx_cmd_out: Arc<Mutex<UnboundedReceiver<Message>>>,
+    ) -> Result<(), SenderClientError> {
+        // abort the current active tasks
+        for h in handles.iter() {
+            h.abort();
+        }
+
+        for h in handles {
+            match h.await {
+                Err(err) if !err.is_cancelled() => {
+                    error!("Join failed: {}", err)
+                }
+                _ => {}
+            }
+        }
+
+        // write the remaining elements from cmd out buffer to stdout
+        let mut channel = rx_cmd_out.lock().await;
+        let mut stdout = tokio::io::stdout();
+        while let Ok(cmd_out) = channel.try_recv() {
+            let data = cmd_out.into_data();
+            stdout
+                .write(&data)
+                .await
+                .map_err(|err| SenderClientError::IOWrite { err })?;
+            stdout.flush().await.expect("writing stdout");
+        }
+
+        info!("EXIT");
+
+        Ok(())
     }
 }
