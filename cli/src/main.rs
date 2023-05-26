@@ -11,7 +11,7 @@ struct Cli {
     command: Commands,
 }
 
-// these commands canbe called from the CLI using lowercase Commands name
+// these commands can be called from the CLI using lowercase Commands name
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Execute a command
