@@ -1,5 +1,5 @@
 use std::ffi::OsStr;
-use std::io;
+use std::io::{self};
 use std::net::SocketAddr;
 use std::string::FromUtf8Error;
 use std::sync::Arc;
@@ -15,9 +15,11 @@ use tokio::sync::mpsc::{Sender, UnboundedReceiver};
 use tokio::sync::MutexGuard;
 use tokio::task::JoinHandle;
 use tokio::{io::AsyncWriteExt, sync::Mutex};
+use tokio_tungstenite::tungstenite::error::ProtocolError;
+use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use tracing::{error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 use url::Url;
 
 #[derive(Error, Debug)]
@@ -32,7 +34,7 @@ pub enum ShellError {
         #[source]
         error: io::Error,
     },
-    #[error("The execution of the command caused an error while formatting the output into UTF8")]
+    #[error("Error while formatting command output into UTF8")]
     WrongOutConversion(#[from] FromUtf8Error),
 }
 
@@ -44,16 +46,12 @@ impl CommandHandler {
         // TODO: open a remote shell (to the input IP addr)
     }
 
+    #[instrument(skip(self))]
     pub async fn execute(&self, cmd: String) -> Result<String, ShellError> {
-        // convert the command into the correct format
+        debug!("Execute command {}", cmd);
         let cmd = shellwords::split(&cmd).map_err(|_| ShellError::MalformedInput)?;
-
-        // try executing the command.
         let cmd_out = self.inner_execute(&cmd).await?;
-
-        std::string::String::from_utf8(cmd_out.stdout)
-            // if the conversion from UTF8 to String goes wrong, return an error
-            .map_err(ShellError::WrongOutConversion)
+        String::from_utf8(cmd_out.stdout).map_err(ShellError::WrongOutConversion)
     }
 
     async fn inner_execute<S>(&self, cmd: &[S]) -> Result<std::process::Output, ShellError>
@@ -133,19 +131,29 @@ impl DeviceServer {
         // join connections and handle errors
         if let Some(err) = rx_err.recv().await {
             // terminate all connections
-            handle_connections.abort();
-
-            match handle_connections.await {
-                Err(err) if !err.is_cancelled() => error!("Join failed: {}", err),
-                _ => {}
-            }
-
-            for h in handles.lock().await.iter() {
-                h.abort();
-            }
-
+            self.terminate(handle_connections, &handles).await?;
             error!("Received error {:?}. Terminate all connections.", err);
             return Err(err);
+        }
+
+        Ok(())
+    }
+
+    #[instrument(skip_all)]
+    async fn terminate(
+        &self,
+        handle_connections: JoinHandle<()>,
+        handles: &Mutex<Vec<JoinHandle<()>>>,
+    ) -> Result<(), DeviceServerError> {
+        handle_connections.abort();
+
+        match handle_connections.await {
+            Err(err) if !err.is_cancelled() => error!("Join failed: {}", err),
+            _ => {}
+        }
+
+        for h in handles.lock().await.iter() {
+            h.abort();
         }
 
         Ok(())
@@ -155,8 +163,11 @@ impl DeviceServer {
     async fn handle_connection(stream: TcpStream, tx_err: TxErrorType) {
         match Self::impl_handle_connection(stream).await {
             Ok(_) => {}
-            Err(DeviceServerError::CloseWebsocket) => {
-                info!("Websocket connection closed");
+            Err(DeviceServerError::CloseWebsocket)
+            | Err(DeviceServerError::Transport(TungsteniteError::Protocol(
+                ProtocolError::ResetWithoutClosingHandshake,
+            ))) => {
+                warn!("Websocket connection closed");
                 // TODO: check that the connection is effectively closed on the server-side (not only on the client-side)
             }
             Err(err) => {
@@ -266,16 +277,22 @@ impl IOHandler {
         self.buf_cmd.clear();
 
         // read a shell command into the stdin and send it to the server
-        self.reader
+        let byte_read = self
+            .reader
             .read_line(&mut self.buf_cmd)
             .await
             .map_err(SenderClientError::IORead)?;
 
-        if self.check_exit() {
-            self.exit().await?;
+        debug!(?byte_read);
+        if byte_read == 0 {
+            info!("EOF received");
+            self.exit().await
+        } else if self.check_exit() {
+            info!("exit received");
+            self.exit().await
+        } else {
+            Ok(())
         }
-
-        Ok(())
     }
 
     #[instrument(skip_all)]
@@ -329,7 +346,7 @@ impl IOHandler {
     #[instrument(skip_all)]
     pub async fn write_stdout(
         &mut self,
-        rx: Arc<Mutex<UnboundedReceiver<Message>>>,
+        rx: &Mutex<UnboundedReceiver<Message>>,
     ) -> Result<(), SenderClientError> {
         // check if there are command outputs stored in the channel. Eventually, print them to the stdout
         let mut channel = rx.lock().await;
@@ -386,7 +403,7 @@ impl SenderClient {
         loop {
             iohandler.read_stdin().await?;
             iohandler.send_to_server().await?;
-            iohandler.write_stdout(Arc::clone(&rx)).await?;
+            iohandler.write_stdout(&rx).await?;
         }
         /*
         loop {
@@ -488,23 +505,24 @@ impl SenderClient {
             Ok(())
         });
 
-        let handles = vec![handle_std_in_out, handle_read];
+        let mut handles = [handle_std_in_out, handle_read];
 
         match rx_err.recv().await.expect("channel error") {
             Ok(()) => {
                 info!("Closing websocket connection");
-                Self::close(handles, rx_cmd_out).await
+                Self::close(&mut handles, rx_cmd_out).await
             }
             Err(err) => {
                 error!("Fatal error: {}", err);
-                Self::close(handles, rx_cmd_out).await
+                Self::close(&mut handles, rx_cmd_out).await?;
+                Err(err)
             }
         }
     }
 
     #[instrument(skip_all)]
     async fn close(
-        handles: Vec<JoinHandle<Result<(), SenderClientError>>>,
+        handles: &mut [JoinHandle<Result<(), SenderClientError>>],
         rx_cmd_out: Arc<Mutex<UnboundedReceiver<Message>>>,
     ) -> Result<(), SenderClientError> {
         // abort the current active tasks
@@ -517,7 +535,12 @@ impl SenderClient {
                 Err(err) if !err.is_cancelled() => {
                     error!("Join failed: {}", err)
                 }
-                _ => {}
+                Err(_) => {
+                    trace!("Task cancelled")
+                }
+                Ok(res) => {
+                    debug!("Task joined with: {:?}", res)
+                }
             }
         }
 
