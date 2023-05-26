@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
     match &cli.command {
         Commands::Listener { addr } => {
             let device_server = DeviceServer::new(*addr);
-            device_server.listen().await?
+            device_server.listen().await?;
         }
         Commands::Sender { listener_addr } => {
             let mut sender_client = SenderClient::new(listener_addr.clone());
