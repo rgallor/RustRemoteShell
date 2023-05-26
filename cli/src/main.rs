@@ -3,9 +3,11 @@ use std::net::SocketAddr;
 use clap::{Parser, Subcommand};
 
 use color_eyre::Result;
-use rust_remote_shell::{DeviceServer, SenderClient};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
+
+use rust_remote_shell::device_server::DeviceServer;
+use rust_remote_shell::sender_client::SenderClient;
 
 /// CLI for a rust remote shell
 #[derive(Debug, Parser)]
@@ -39,7 +41,7 @@ async fn main() -> Result<()> {
     match &cli.command {
         Commands::Listener { addr } => {
             let device_server = DeviceServer::new(*addr);
-            device_server.listen().await?;
+            device_server.listen().await?
         }
         Commands::Sender { listener_addr } => {
             let mut sender_client = SenderClient::new(listener_addr.clone());
