@@ -1,5 +1,4 @@
 [workspace]
-rust-version = "1.59.0"
 members = [
     "cli",
     "rust-remote-shell",

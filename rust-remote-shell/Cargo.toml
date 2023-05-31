@@ -10,16 +10,17 @@ rust-version = "1.59.0"
 
 [dependencies]
 futures = "0.3.28"
-rustls = {version = "0.21.1", optional = true }
+tokio-rustls = { version = "0.23.4", optional = true }
 shellwords = "1.1.0"
 thiserror = "1.0.40"
 tokio = { version = "1.28.1", features = ["full"] }
 tokio-tungstenite = "0.18.0"
 tracing = "0.1.37"
 url = "2.3.1"
+rustls-pemfile = {version = "1.0.2", optional = true }
 # pinned transitive dependencies
 security-framework = "=2.8.1"
 
 [features]
 default = ["tls"]
-tls = ["tokio-tungstenite/rustls-tls-native-roots", "rustls"]
+tls = ["tokio-tungstenite/rustls-tls-native-roots", "tokio-rustls", "rustls-pemfile"]

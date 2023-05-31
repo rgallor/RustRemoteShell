@@ -1,7 +1,8 @@
+use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 
-use clap::{Parser, Subcommand};
 use color_eyre::Result;
+
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
@@ -42,7 +43,7 @@ async fn main() -> Result<()> {
             device_server.listen().await?;
         }
         Commands::Sender { listener_addr } => {
-            let mut sender_client = SenderClient::new(listener_addr.clone());
+            let mut sender_client = SenderClient::new(listener_addr.clone()).await;
             sender_client.connect().await?;
         }
     }

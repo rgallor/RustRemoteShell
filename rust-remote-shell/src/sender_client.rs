@@ -8,12 +8,31 @@ use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{Sender, UnboundedReceiver};
 use tokio::task::JoinHandle;
 use tokio::{io::AsyncWriteExt, sync::Mutex};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_rustls::rustls;
+use tokio_rustls::rustls::{Certificate, ClientConfig, RootCertStore};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{
+    connect_async_tls_with_config, Connector, MaybeTlsStream, WebSocketStream,
+};
 use tracing::{debug, error, info, instrument, trace};
 use url::Url;
 
 use crate::io_handler::IOHandler;
+
+// configuration options for TLS connection
+async fn tls_client_config() -> ClientConfig {
+    let mut root_certs = RootCertStore::empty();
+    let cert_file = tokio::fs::read("certs/CA.der")
+        .await
+        .expect("no cert found");
+    let cert = Certificate(cert_file);
+    root_certs.add(&cert).unwrap();
+
+    ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(root_certs)
+        .with_no_client_auth()
+}
 
 #[derive(Error, Debug)]
 pub enum SenderClientError {
@@ -40,36 +59,33 @@ pub enum SenderClientError {
 #[derive(Debug)]
 pub struct SenderClient {
     listener_url: Url,
+    tls_config: Arc<rustls::ClientConfig>,
 }
 
 impl SenderClient {
-    pub fn new(listener_url: Url) -> Self {
-        Self { listener_url }
-    }
-
-    async fn read_write(
-        write: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
-        rx: Arc<Mutex<UnboundedReceiver<Message>>>,
-        tx_err: Sender<Result<(), SenderClientError>>,
-    ) -> Result<(), SenderClientError> {
-        let mut iohandler = IOHandler::new(write, tx_err);
-
-        // read from stdin and, if messages are present on the channel (rx) print them to the stdout
-        loop {
-            iohandler.read_stdin().await?;
-            iohandler.send_to_server().await?;
-            iohandler.write_stdout(&rx).await?;
+    pub async fn new(listener_url: Url) -> Self {
+        let tls_config = Arc::new(tls_client_config().await);
+        Self {
+            listener_url,
+            tls_config,
         }
     }
 
     #[instrument(skip(self))]
     pub async fn connect(&mut self) -> Result<(), SenderClientError> {
         // Websocket connection to an existing server
-        let (ws_stream, _) = connect_async(self.listener_url.clone())
-            .await
-            .map_err(SenderClientError::WebSocketConnect)?;
+        let connector = Connector::Rustls(Arc::clone(&self.tls_config));
+        let (ws_stream, _) =
+            connect_async_tls_with_config(self.listener_url.clone(), None, Some(connector))
+                .await
+                .map_err(|err| {
+                    error!("Websocket error: {:?}", err);
+                    SenderClientError::WebSocketConnect(err)
+                })?;
 
-        info!("WebSocket handshake has been successfully completed");
+        // TODO: check that the TLS connection has been effectively established
+
+        info!("WebSocket handshake has been successfully completed on a TLS protected stream");
 
         let (write, read) = ws_stream.split();
 
@@ -110,6 +126,21 @@ impl SenderClient {
                 Self::close(&mut handles, rx_cmd_out).await?;
                 Err(err)
             }
+        }
+    }
+
+    async fn read_write(
+        write: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+        rx: Arc<Mutex<UnboundedReceiver<Message>>>,
+        tx_err: Sender<Result<(), SenderClientError>>,
+    ) -> Result<(), SenderClientError> {
+        let mut iohandler = IOHandler::new(write, tx_err);
+
+        // read from stdin and, if messages are present on the channel (rx) print them to the stdout
+        loop {
+            iohandler.read_stdin().await?;
+            iohandler.send_to_server().await?;
+            iohandler.write_stdout(&rx).await?;
         }
     }
 
