@@ -1,4 +1,4 @@
-use std::io::{self};
+use std::io::{self, ErrorKind};
 use std::net::SocketAddr;
 use std::string::FromUtf8Error;
 use std::sync::Arc;
@@ -198,7 +198,11 @@ where
                 ProtocolError::ResetWithoutClosingHandshake,
             ))) => {
                 warn!("Websocket connection closed");
-                // TODO: check that the connection is effectively closed on the server-side (not only on the client-side)
+            }
+            Err(ServerError::Transport(TungsteniteError::Io(err)))
+                if err.kind() == ErrorKind::UnexpectedEof =>
+            {
+                warn!("Websocket connection closed");
             }
             Err(err) => {
                 error!("Fatal error occurred: {}", err);
