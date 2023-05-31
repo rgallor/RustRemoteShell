@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use futures::stream::SplitSink;
 use futures::{StreamExt, TryStreamExt};
 use thiserror::Error;
@@ -8,40 +9,29 @@ use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{Sender, UnboundedReceiver};
 use tokio::task::JoinHandle;
 use tokio::{io::AsyncWriteExt, sync::Mutex};
-use tokio_rustls::rustls;
-use tokio_rustls::rustls::{Certificate, ClientConfig, RootCertStore};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{
-    connect_async_tls_with_config, Connector, MaybeTlsStream, WebSocketStream,
-};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, instrument, trace};
 use url::Url;
 
 use crate::io_handler::IOHandler;
 
-// configuration options for TLS connection
-async fn tls_client_config() -> ClientConfig {
-    let mut root_certs = RootCertStore::empty();
-    let cert_file = tokio::fs::read("certs/CA.der")
-        .await
-        .expect("no cert found");
-    let cert = Certificate(cert_file);
-    root_certs.add(&cert).unwrap();
-
-    ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(root_certs)
-        .with_no_client_auth()
-}
+#[cfg(feature = "tls")]
+use crate::tls::*;
 
 #[derive(Error, Debug)]
-pub enum SenderClientError {
+pub enum ClientError {
     #[error("Error while trying to connect with server")]
     WebSocketConnect(#[from] tokio_tungstenite::tungstenite::Error),
     #[error("IO error occurred while reading from stdin")]
     IORead(#[from] std::io::Error),
     #[error("IO error occurred while writing to stdout")]
     IOWrite {
+        #[source]
+        err: std::io::Error,
+    },
+    #[error("Failed to read CA certificate from file")]
+    ReadCAFile {
         #[source]
         err: std::io::Error,
     },
@@ -52,48 +42,63 @@ pub enum SenderClientError {
         #[source]
         err: tokio_tungstenite::tungstenite::Error,
     },
+    #[error("Error from Tungstenite while closing websocket connection")]
+    TungsteniteClose {
+        #[source]
+        err: tokio_tungstenite::tungstenite::Error,
+    },
     #[error("Server disconnected")]
     Disconnected,
 }
 
-#[derive(Debug)]
-pub struct SenderClient {
-    listener_url: Url,
-    tls_config: Arc<rustls::ClientConfig>,
+#[async_trait]
+pub trait ClientConnect {
+    async fn connect(&mut self) -> Result<(), ClientError>;
+    fn get_ws_stream(self) -> Option<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 }
 
-impl SenderClient {
-    pub async fn new(listener_url: Url) -> Self {
-        let tls_config = Arc::new(tls_client_config().await);
-        Self {
-            listener_url,
-            tls_config,
-        }
+pub struct Client<C> {
+    pub connector: C,
+}
+
+impl Client<TcpClientConnector> {
+    #[cfg(feature = "tls")]
+    pub async fn with_tls(
+        self,
+        ca_cert: Vec<u8>,
+    ) -> Result<Client<TlsClientConnector>, ClientError> {
+        let tls_connector = client_tls_config(ca_cert).await;
+        let connector = TlsClientConnector::new(self.connector, tls_connector);
+        Ok(Client { connector })
+    }
+}
+
+impl<C> Client<C>
+where
+    C: ClientConnect + 'static,
+{
+    pub async fn new(listener_url: Url) -> Result<Client<TcpClientConnector>, ClientError> {
+        let connector = TcpClientConnector::new(listener_url).await?;
+        Ok(Client { connector })
     }
 
-    #[instrument(skip(self))]
-    pub async fn connect(&mut self) -> Result<(), SenderClientError> {
-        // Websocket connection to an existing server
-        let connector = Connector::Rustls(Arc::clone(&self.tls_config));
-        let (ws_stream, _) =
-            connect_async_tls_with_config(self.listener_url.clone(), None, Some(connector))
-                .await
-                .map_err(|err| {
-                    error!("Websocket error: {:?}", err);
-                    SenderClientError::WebSocketConnect(err)
-                })?;
+    pub async fn connect(&mut self) -> Result<(), ClientError> {
+        self.connector.connect().await
+    }
 
-        // TODO: check that the TLS connection has been effectively established
-
-        info!("WebSocket handshake has been successfully completed on a TLS protected stream");
-
-        let (write, read) = ws_stream.split();
+    #[instrument(skip_all)]
+    pub async fn handle_connection(self) -> Result<(), ClientError> {
+        let (write, read) = self
+            .connector
+            .get_ws_stream()
+            .expect("websocket connection must have been previously created")
+            .split();
 
         let (tx_cmd_out, rx_cmd_out) = tokio::sync::mpsc::unbounded_channel::<Message>();
         let rx_cmd_out = Arc::new(Mutex::new(rx_cmd_out));
         let rx_cmd_out_clone = Arc::clone(&rx_cmd_out);
 
-        let (tx_err, mut rx_err) = tokio::sync::mpsc::channel::<Result<(), SenderClientError>>(1);
+        let (tx_err, mut rx_err) = tokio::sync::mpsc::channel::<Result<(), ClientError>>(1);
 
         // handle stdin and stdout
         let handle_std_in_out =
@@ -101,9 +106,9 @@ impl SenderClient {
 
         let handle_read = tokio::spawn(async move {
             let res = read
-                .map_err(|err| SenderClientError::TungsteniteReadData { err })
+                .map_err(|err| ClientError::TungsteniteReadData { err })
                 .try_for_each(|cmd_out| async {
-                    tx_cmd_out.send(cmd_out).map_err(SenderClientError::Channel)
+                    tx_cmd_out.send(cmd_out).map_err(ClientError::Channel)
                 })
                 .await;
 
@@ -132,13 +137,16 @@ impl SenderClient {
     async fn read_write(
         write: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
         rx: Arc<Mutex<UnboundedReceiver<Message>>>,
-        tx_err: Sender<Result<(), SenderClientError>>,
-    ) -> Result<(), SenderClientError> {
+        tx_err: Sender<Result<(), ClientError>>,
+    ) -> Result<(), ClientError> {
         let mut iohandler = IOHandler::new(write, tx_err);
 
         // read from stdin and, if messages are present on the channel (rx) print them to the stdout
         loop {
             iohandler.read_stdin().await?;
+            if iohandler.is_exited() {
+                break Ok(());
+            }
             iohandler.send_to_server().await?;
             iohandler.write_stdout(&rx).await?;
         }
@@ -146,9 +154,9 @@ impl SenderClient {
 
     #[instrument(skip_all)]
     async fn close(
-        handles: &mut [JoinHandle<Result<(), SenderClientError>>],
+        handles: &mut [JoinHandle<Result<(), ClientError>>],
         rx_cmd_out: Arc<Mutex<UnboundedReceiver<Message>>>,
-    ) -> Result<(), SenderClientError> {
+    ) -> Result<(), ClientError> {
         // abort the current active tasks
         for h in handles.iter() {
             h.abort();
@@ -176,12 +184,65 @@ impl SenderClient {
             stdout
                 .write(&data)
                 .await
-                .map_err(|err| SenderClientError::IOWrite { err })?;
-            stdout.flush().await.expect("writing stdout");
+                .map_err(|err| ClientError::IOWrite { err })?;
+            stdout
+                .flush()
+                .await
+                .map_err(|err| ClientError::IOWrite { err })?;
         }
 
-        info!("EXIT");
+        info!("Client terminated");
 
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct TcpClientConnector {
+    listener_url: Url,
+    ws_stream: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+}
+
+#[async_trait]
+impl ClientConnect for TcpClientConnector {
+    #[instrument(skip(self))]
+    async fn connect(&mut self) -> Result<(), ClientError> {
+        use tokio_tungstenite::connect_async;
+        // Websocket connection to an existing server
+        let (ws_stream, _) = connect_async(self.listener_url.clone())
+            .await
+            .map_err(|err| {
+                error!("Websocket error: {:?}", err);
+                ClientError::WebSocketConnect(err)
+            })?;
+
+        info!("WebSocket handshake has been successfully completed on a NON-TLS protected stream");
+
+        self.ws_stream = Some(ws_stream);
+
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
+    fn get_ws_stream(self) -> Option<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+        self.ws_stream
+    }
+}
+
+// TODO: CAPIRE SE SPOSTARE METODI DENTRO LA STRUCT CLIENT
+impl TcpClientConnector {
+    pub async fn new(listener_url: Url) -> Result<Self, ClientError> {
+        Ok(Self {
+            listener_url,
+            ws_stream: None,
+        })
+    }
+
+    pub fn get_listener_url(&self) -> Url {
+        self.listener_url.clone()
+    }
+
+    pub fn set_ws_stream(&mut self, ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>) {
+        self.ws_stream = Some(ws_stream);
     }
 }

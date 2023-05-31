@@ -10,21 +10,22 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{debug, info, instrument, warn};
 
-use crate::sender_client::SenderClientError;
+use crate::sender_client::ClientError;
 
 #[derive(Debug)]
 pub struct IOHandler {
     stdout: Stdout,
     reader: BufReader<Stdin>,
     write: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
-    tx_err: Sender<Result<(), SenderClientError>>,
+    tx_err: Sender<Result<(), ClientError>>,
     buf_cmd: String,
+    exited: bool,
 }
 
 impl IOHandler {
     pub fn new(
         write: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
-        tx_err: Sender<Result<(), SenderClientError>>,
+        tx_err: Sender<Result<(), ClientError>>,
     ) -> Self {
         Self {
             stdout: tokio::io::stdout(),
@@ -32,11 +33,13 @@ impl IOHandler {
             write,
             tx_err,
             buf_cmd: String::new(),
+            exited: false,
         }
     }
 
     #[instrument(skip_all)]
-    pub async fn read_stdin(&mut self) -> Result<(), SenderClientError> {
+    pub async fn read_stdin(&mut self) -> Result<(), ClientError> {
+        // empty the buffer so to be able to store incoming command
         self.buf_cmd.clear();
 
         // read a shell command from the stdin and send it to the server
@@ -44,48 +47,51 @@ impl IOHandler {
             .reader
             .read_line(&mut self.buf_cmd)
             .await
-            .map_err(SenderClientError::IORead)?;
+            .map_err(ClientError::IORead)?;
 
         debug!(?byte_read);
         if byte_read == 0 {
             info!("EOF received");
-            self.exit().await
+            self.exit().await?;
         } else if self.check_exit() {
             info!("exit received");
-            self.exit().await
-        } else {
-            Ok(())
+            self.exit().await?;
         }
+
+        Ok(())
     }
 
     #[instrument(skip_all)]
     fn check_exit(&self) -> bool {
-        self.buf_cmd.starts_with("exit")
+        matches!(self.buf_cmd.split_ascii_whitespace().next(), Some(cmd) if cmd == "exit")
     }
 
     #[instrument(skip_all)]
-    async fn exit(&mut self) -> Result<(), SenderClientError> {
-        // check if the command is exit. Eventually, close the connection
-
+    async fn exit(&mut self) -> Result<(), ClientError> {
+        // close the connection
         self.write
             .send(Message::Close(None))
             .await
-            .expect("Error while closing websocket connection");
+            .map_err(|err| ClientError::TungsteniteClose { err })?;
         info!("Closed websocket on client side");
 
         self.tx_err.send(Ok(())).await.expect("channel error");
 
-        Ok(()) // send Ok(()) to close the connection on client side
-               //break Ok(());
+        self.exited = true;
+        Ok(())
+    }
+
+    pub fn is_exited(&self) -> bool {
+        self.exited
     }
 
     #[instrument(skip_all)]
-    pub async fn send_to_server(&mut self) -> Result<(), SenderClientError> {
+    pub async fn send_to_server(&mut self) -> Result<(), ClientError> {
         info!("Send command to the server");
         self.write
             .send(Message::Binary(self.buf_cmd.as_bytes().to_vec()))
             .await
-            .map_err(|err| SenderClientError::TungsteniteReadData { err })?;
+            .map_err(|err| ClientError::TungsteniteReadData { err })?;
 
         info!("Command sent: {}", self.buf_cmd);
 
@@ -96,7 +102,7 @@ impl IOHandler {
     pub async fn write_stdout(
         &mut self,
         rx: &Mutex<UnboundedReceiver<Message>>,
-    ) -> Result<(), SenderClientError> {
+    ) -> Result<(), ClientError> {
         // check if there are command outputs stored in the channel. Eventually, print them to the stdout
         let mut channel = rx.lock().await;
 
@@ -112,15 +118,18 @@ impl IOHandler {
     }
 
     #[instrument(skip_all)]
-    async fn impl_write_stdout(&mut self, msg: Message) -> Result<(), SenderClientError> {
+    async fn impl_write_stdout(&mut self, msg: Message) -> Result<(), ClientError> {
         let data = msg.into_data();
 
         self.stdout
             .write(&data)
             .await
-            .map_err(|err| SenderClientError::IOWrite { err })?;
+            .map_err(|err| ClientError::IOWrite { err })?;
 
-        self.stdout.flush().await.expect("writing stdout");
+        self.stdout
+            .flush()
+            .await
+            .map_err(|err| ClientError::IOWrite { err })?;
 
         Ok(())
     }
@@ -128,7 +137,7 @@ impl IOHandler {
     async fn empty_buffer(
         &mut self,
         mut channel: MutexGuard<'_, UnboundedReceiver<Message>>,
-    ) -> Result<(), SenderClientError> {
+    ) -> Result<(), ClientError> {
         loop {
             match channel.try_recv() {
                 Ok(msg) => {
@@ -136,7 +145,7 @@ impl IOHandler {
                 }
                 Err(TryRecvError::Empty) => {
                     // the channel is empty but the connection is still open
-                    break Ok(()); // TODO: check that Ok(()) is a good return value
+                    break Ok(());
                 }
                 Err(TryRecvError::Disconnected) => {
                     unreachable!("the channel should not be dropped before the task is aborted")

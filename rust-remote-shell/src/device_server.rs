@@ -3,23 +3,43 @@ use std::net::SocketAddr;
 use std::string::FromUtf8Error;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use futures::{SinkExt, StreamExt, TryStreamExt};
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tokio_rustls::{server::TlsStream, TlsAcceptor};
+
 use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{error, info, instrument, warn};
 
 use crate::shell::{CommandHandler, ShellError};
 
+// Avoid importing tls module if TLS is not enabled
+#[cfg(feature = "tls")]
+use crate::tls::*;
+
+type TxErrorType = tokio::sync::mpsc::Sender<ServerError>;
+const MAX_ERRORS_TO_HANDLE: usize = 10;
+
 #[derive(Error, Debug)]
-pub enum DeviceServerError {
+pub enum ServerError {
     #[error("Failed to bind")]
     Bind(#[from] io::Error),
+    #[error("Failed to accept a new connection")]
+    AcceptConnection {
+        #[source]
+        err: io::Error,
+    },
+    #[error("Failed to read {file} from file")]
+    ReadFile {
+        #[source]
+        err: io::Error,
+        file: String,
+    },
     #[error("Connected streams should have a peer address")]
     PeerAddr,
     #[error("Error during the websocket handshake occurred")]
@@ -35,63 +55,110 @@ pub enum DeviceServerError {
     #[error("Close websocket connection")]
     CloseWebsocket,
     #[error("Error while establishing a TLS connection")]
+    #[cfg(feature = "tls")]
     RustTls(#[from] tokio_rustls::rustls::Error),
 }
 
-type TxErrorType = tokio::sync::mpsc::Sender<DeviceServerError>;
-const MAX_ERRORS_TO_HANDLE: usize = 10;
-
-#[derive(Debug)]
-pub struct DeviceServer {
-    addr: SocketAddr,
+#[async_trait]
+pub trait Connect<S, L> {
+    async fn bind(&mut self, addr: SocketAddr) -> Result<L, ServerError>;
+    async fn connect(&mut self, listener: &mut L) -> Result<S, ServerError>;
 }
 
-impl DeviceServer {
-    pub fn new(addr: SocketAddr) -> Self {
-        Self { addr }
+pub struct TcpConnector;
+
+#[async_trait]
+impl Connect<TcpStream, TcpListener> for TcpConnector {
+    async fn bind(&mut self, addr: SocketAddr) -> Result<TcpListener, ServerError> {
+        TcpListener::bind(addr).await.map_err(ServerError::Bind)
+    }
+
+    async fn connect(&mut self, listener: &mut TcpListener) -> Result<TcpStream, ServerError> {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .map_err(|err| ServerError::AcceptConnection { err })?;
+        Ok(stream)
+    }
+}
+
+#[derive(Debug)]
+pub struct Server<C> {
+    addr: SocketAddr,
+    connector: C,
+}
+
+impl Server<TcpConnector> {
+    // Avoid compiling the whole function if TLS is not enabled
+    #[cfg(feature = "tls")]
+    pub async fn with_tls(
+        self,
+        cert: Vec<u8>,
+        privkey: Vec<u8>,
+    ) -> Result<Server<TlsConnector>, ServerError> {
+        let tls_config = server_tls_config(cert, privkey).await?;
+        let tls_config = Arc::new(tls_config);
+        let connector = TlsConnector::new(self.connector, tls_config);
+
+        Ok(Server {
+            addr: self.addr,
+            connector,
+        })
+    }
+}
+
+impl<C> Server<C>
+where
+    C: Send + 'static,
+{
+    pub fn new(addr: SocketAddr) -> Server<TcpConnector> {
+        Server {
+            addr,
+            connector: TcpConnector,
+        }
     }
 
     #[instrument(skip(self))]
-    pub async fn listen(&self) -> Result<(), DeviceServerError> {
-        // let socket = TcpListener::bind(self.addr)
-        //     .await
-        //     .map_err(DeviceServerError::Bind)?;
+    pub async fn listen<S>(mut self) -> Result<(), ServerError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        C: Connect<S, TcpListener>,
+    {
+        let mut listener = self.connector.bind(self.addr).await?;
+
+        info!("Listening at {}", self.addr);
 
         // channel tx/rx to handle error
-        let (tx_err, mut rx_err) =
-            tokio::sync::mpsc::channel::<DeviceServerError>(MAX_ERRORS_TO_HANDLE);
+        let (tx_err, mut rx_err) = tokio::sync::mpsc::channel::<ServerError>(MAX_ERRORS_TO_HANDLE);
 
         let handles = Arc::new(Mutex::new(Vec::new()));
         let handles_clone = Arc::clone(&handles);
 
-        // create a TLS connection
-        let tls_config = Arc::new(server_tls_config().await?);
-        let acceptor = TlsAcceptor::from(tls_config);
-
-        let listener = TcpListener::bind(self.addr)
-            .await
-            .map_err(DeviceServerError::Bind)?;
-
-        info!("Listening at {}", self.addr);
-
         // accept a new connection
         let handle_connections = tokio::spawn(async move {
-            let acceptor_clone = acceptor.clone();
-            while let Ok((stream, _)) = listener.accept().await {
-                let stream = acceptor_clone
-                    .accept(stream)
-                    .await
-                    .expect("expected TLS stream");
+            loop {
+                let stream = match self.connector.connect(&mut listener).await {
+                    Ok(s) => s,
+                    Err(err) => {
+                        error!("Connection error: {:?}", err);
+                        tx_err
+                            .send(err)
+                            .await
+                            .expect("error while sending on channel");
+                        break;
+                    }
+                };
+
                 let handle_single_connection =
                     tokio::spawn(Self::handle_connection(stream, tx_err.clone()));
 
-                handles_clone.lock().await.push(handle_single_connection);
+                handles.lock().await.push(handle_single_connection);
             }
         });
 
         // join connections and handle errors
         if let Some(err) = rx_err.recv().await {
-            self.terminate(handle_connections, &handles).await?;
+            Self::terminate(handle_connections, handles_clone).await?;
             error!("Received error {:?}. Terminate all connections.", err);
             return Err(err);
         }
@@ -102,10 +169,9 @@ impl DeviceServer {
     // terminate all connections
     #[instrument(skip_all)]
     async fn terminate(
-        &self,
         handle_connections: JoinHandle<()>,
-        handles: &Mutex<Vec<JoinHandle<()>>>,
-    ) -> Result<(), DeviceServerError> {
+        handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    ) -> Result<(), ServerError> {
         handle_connections.abort();
 
         match handle_connections.await {
@@ -121,11 +187,14 @@ impl DeviceServer {
     }
 
     #[instrument(skip_all)]
-    async fn handle_connection(stream: TlsStream<TcpStream>, tx_err: TxErrorType) {
+    async fn handle_connection<S>(stream: S, tx_err: TxErrorType)
+    where
+        S: AsyncWrite + AsyncRead + Unpin,
+    {
         match Self::impl_handle_connection(stream).await {
             Ok(_) => {}
-            Err(DeviceServerError::CloseWebsocket)
-            | Err(DeviceServerError::Transport(TungsteniteError::Protocol(
+            Err(ServerError::CloseWebsocket)
+            | Err(ServerError::Transport(TungsteniteError::Protocol(
                 ProtocolError::ResetWithoutClosingHandshake,
             ))) => {
                 warn!("Websocket connection closed");
@@ -139,35 +208,30 @@ impl DeviceServer {
     }
 
     #[instrument(skip_all)]
-    async fn impl_handle_connection(stream: TlsStream<TcpStream>) -> Result<(), DeviceServerError> {
-        let addr = stream
-            .get_ref()
-            .0
-            .peer_addr()
-            .map_err(|_| DeviceServerError::PeerAddr)?;
-
+    async fn impl_handle_connection<S>(stream: S) -> Result<(), ServerError>
+    where
+        S: AsyncWrite + AsyncRead + Unpin,
+    {
         //create a WebSocket connection
         let web_socket_stream = accept_async(stream).await.map_err(|err| {
             error!("Websocket error: {:?}", err);
-            DeviceServerError::WebSocketHandshake
+            ServerError::WebSocketHandshake
         })?;
 
-        info!("New WebSocket connection created over TLS: {}", addr);
+        info!("New WebSocket connection created");
 
         // separate ownership between receiving and writing part
         let (write, read) = web_socket_stream.split();
 
         // Read the received command
-        read.map_err(DeviceServerError::Transport)
+        read.map_err(ServerError::Transport)
             .and_then(|msg| async move {
                 info!("Received command from the client");
                 match msg {
                     // convert the message from a Vec<u8> into a OsString
-                    Message::Binary(v) => {
-                        String::from_utf8(v).map_err(DeviceServerError::Utf8Error)
-                    }
-                    Message::Close(_) => Err(DeviceServerError::CloseWebsocket), // the client closed the connection
-                    _ => Err(DeviceServerError::ReadCommand),
+                    Message::Binary(v) => String::from_utf8(v).map_err(ServerError::Utf8Error),
+                    Message::Close(_) => Err(ServerError::CloseWebsocket), // the client closed the connection
+                    _ => Err(ServerError::ReadCommand),
                 }
             })
             .and_then(|cmd| async move {
@@ -183,37 +247,9 @@ impl DeviceServer {
                 info!("Send command output to the client");
                 Ok(Message::Binary(cmd_out.as_bytes().to_vec()))
             })
-            .forward(write.sink_map_err(DeviceServerError::Transport))
+            .forward(write.sink_map_err(ServerError::Transport))
             .await?;
 
         Ok(())
     }
-}
-
-#[instrument]
-async fn server_tls_config() -> Result<tokio_rustls::rustls::ServerConfig, DeviceServerError> {
-    let mut certs = Vec::new();
-
-    let cert_file = tokio::fs::read("certs/localhost.local.der")
-        .await
-        .expect("no server cert found");
-    certs.push(tokio_rustls::rustls::Certificate(cert_file));
-
-    debug!("certs created");
-
-    let privkey = tokio::fs::read("certs/localhost.local.key.der")
-        .await
-        .expect("no server private key found");
-    let privkey = tokio_rustls::rustls::PrivateKey(privkey);
-    debug!("private key retrieved");
-
-    let config = tokio_rustls::rustls::ServerConfig::builder()
-        .with_safe_defaults()
-        .with_no_client_auth()
-        .with_single_cert(certs, privkey)
-        .map_err(DeviceServerError::RustTls)?;
-
-    debug!("config created: {:?}", config);
-
-    Ok(config)
 }
