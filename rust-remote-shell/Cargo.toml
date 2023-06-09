@@ -19,6 +19,7 @@ tracing = "0.1.37"
 url = "2.3.1"
 rustls-pemfile = {version = "1.0.2", optional = true }
 async-trait = "0.1.68"
+tower = "0.4.13"
 # pinned transitive dependencies
 security-framework = "=2.8.1"
 
