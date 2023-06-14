@@ -217,7 +217,7 @@ where
         S: AsyncWrite + AsyncRead + Unpin,
     {
         //create a WebSocket connection
-        let web_socket_stream = accept_async(stream).await.map_err(|err| {
+        let ws_stream = accept_async(stream).await.map_err(|err| {
             error!("Websocket error: {:?}", err);
             ServerError::WebSocketHandshake
         })?;
@@ -225,7 +225,7 @@ where
         info!("New WebSocket connection created");
 
         // separate ownership between receiving and writing part
-        let (write, read) = web_socket_stream.split();
+        let (write, read) = ws_stream.split();
 
         // Read the received command
         read.map_err(ServerError::Transport)

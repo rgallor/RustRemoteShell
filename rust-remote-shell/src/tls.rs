@@ -1,23 +1,27 @@
-use async_trait::async_trait;
 use futures::Future;
-use std::net::SocketAddr;
+
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::rustls::{Certificate, ClientConfig, PrivateKey, RootCertStore, ServerConfig};
+use tokio::net::TcpStream;
+use tokio_rustls::rustls::{Certificate, ClientConfig, PrivateKey, RootCertStore};
 use tokio_rustls::{server::TlsStream, TlsAcceptor};
 use tokio_tungstenite::{
     connect_async_tls_with_config, Connector, MaybeTlsStream, WebSocketStream,
 };
 use tower::layer::util::{Identity, Stack};
 use tower::{Layer, Service};
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, instrument};
 use url::Url;
 
-use crate::device_server::{Connect, ServerError, TcpConnector};
-use crate::host::HostBuilder;
-use crate::sender_client::{ClientConnect, ClientError, TcpClientConnector};
+use crate::device::DeviceError;
+use crate::host::{HostBuilder, HostError};
+
+/*
+use async_trait::async_trait;
+use std::net::SocketAddr;
+use tokio::net::TcpListener;
+use crate::sender_client::{ClientConnect, HostError, TcpClientConnector};
 
 pub struct TlsConnector {
     listener: TcpConnector,
@@ -36,19 +40,19 @@ impl TlsConnector {
 
 #[async_trait]
 impl Connect<TlsStream<TcpStream>, TcpListener> for TlsConnector {
-    async fn bind(&mut self, addr: SocketAddr) -> Result<TcpListener, ServerError> {
+    async fn bind(&mut self, addr: SocketAddr) -> Result<TcpListener, DeviceError> {
         self.listener.bind(addr).await
     }
 
     async fn connect(
         &mut self,
         listener: &mut TcpListener,
-    ) -> Result<TlsStream<TcpStream>, ServerError> {
+    ) -> Result<TlsStream<TcpStream>, DeviceError> {
         let stream = self.listener.connect(listener).await?;
         self.acceptor
             .accept(stream)
             .await
-            .map_err(|err| ServerError::AcceptConnection { err })
+            .map_err(|err| DeviceError::AcceptConnection { err })
     }
 }
 
@@ -82,7 +86,7 @@ impl TlsClientConnector {
 #[async_trait]
 impl ClientConnect for TlsClientConnector {
     #[instrument(skip(self))]
-    async fn connect(&mut self) -> Result<(), ClientError> {
+    async fn connect(&mut self) -> Result<(), HostError> {
         use tokio_tungstenite::connect_async_tls_with_config;
 
         // Websocket connection to an existing server
@@ -94,7 +98,7 @@ impl ClientConnect for TlsClientConnector {
         .await
         .map_err(|err| {
             error!("Websocket error: {:?}", err);
-            ClientError::WebSocketConnect(err)
+            HostError::WebSocketConnect(err)
         })?;
 
         info!("WebSocket handshake has been successfully completed on a TLS protected stream");
@@ -110,13 +114,15 @@ impl ClientConnect for TlsClientConnector {
     }
 }
 
+*/
+
 // ----------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 #[instrument(skip_all)]
 pub async fn server_tls_config<C, P>(
     cert: C,
     privkey: P,
-) -> Result<tokio_rustls::rustls::ServerConfig, ServerError>
+) -> Result<tokio_rustls::rustls::ServerConfig, DeviceError>
 where
     C: Into<Vec<u8>>,
     P: Into<Vec<u8>>,
@@ -127,14 +133,14 @@ where
         .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(certs, PrivateKey(privkey.into()))
-        .map_err(ServerError::RustTls)?;
+        .map_err(DeviceError::RustTls)?;
 
     debug!("config created: {:?}", config);
 
     Ok(config)
 }
 
-pub async fn acceptor<C, P>(cert: C, privkey: P) -> Result<TlsAcceptor, ServerError>
+pub async fn acceptor<C, P>(cert: C, privkey: P) -> Result<TlsAcceptor, DeviceError>
 where
     C: Into<Vec<u8>>,
     P: Into<Vec<u8>>,
@@ -160,10 +166,10 @@ pub async fn client_tls_config(ca_cert: Vec<u8>) -> Connector {
 pub async fn connect(
     url: &Url,
     connector: Option<Connector>,
-) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, ClientError> {
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, HostError> {
     let (ws_stream, _) = connect_async_tls_with_config(url, None, connector)
         .await
-        .map_err(ClientError::WebSocketConnect)?;
+        .map_err(HostError::WebSocketConnect)?;
 
     Ok(ws_stream)
 }

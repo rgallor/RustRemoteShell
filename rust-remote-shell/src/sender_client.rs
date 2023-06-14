@@ -20,7 +20,7 @@ use crate::io_handler::IOHandler;
 use crate::tls::*;
 
 #[derive(Error, Debug)]
-pub enum ClientError {
+pub enum HostError {
     #[error("Error while trying to connect with server")]
     WebSocketConnect(#[from] tokio_tungstenite::tungstenite::Error),
     #[error("IO error occurred while reading from stdin")]
@@ -53,7 +53,7 @@ pub enum ClientError {
 
 #[async_trait]
 pub trait ClientConnect {
-    async fn connect(&mut self) -> Result<(), ClientError>;
+    async fn connect(&mut self) -> Result<(), HostError>;
     fn get_ws_stream(self) -> Option<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 }
 
@@ -63,10 +63,7 @@ pub struct Client<C> {
 
 impl Client<TcpClientConnector> {
     #[cfg(feature = "tls")]
-    pub async fn with_tls(
-        self,
-        ca_cert: Vec<u8>,
-    ) -> Result<Client<TlsClientConnector>, ClientError> {
+    pub async fn with_tls(self, ca_cert: Vec<u8>) -> Result<Client<TlsClientConnector>, HostError> {
         let tls_connector = client_tls_config(ca_cert).await;
         let connector = TlsClientConnector::new(self.connector, tls_connector);
         Ok(Client { connector })
@@ -77,17 +74,17 @@ impl<C> Client<C>
 where
     C: ClientConnect + 'static,
 {
-    pub async fn new(listener_url: Url) -> Result<Client<TcpClientConnector>, ClientError> {
+    pub async fn new(listener_url: Url) -> Result<Client<TcpClientConnector>, HostError> {
         let connector = TcpClientConnector::new(listener_url).await?;
         Ok(Client { connector })
     }
 
-    pub async fn connect(&mut self) -> Result<(), ClientError> {
+    pub async fn connect(&mut self) -> Result<(), HostError> {
         self.connector.connect().await
     }
 
     #[instrument(skip_all)]
-    pub async fn handle_connection(self) -> Result<(), ClientError> {
+    pub async fn handle_connection(self) -> Result<(), HostError> {
         let (write, read) = self
             .connector
             .get_ws_stream()
@@ -98,7 +95,7 @@ where
         let rx_cmd_out = Arc::new(Mutex::new(rx_cmd_out));
         let rx_cmd_out_clone = Arc::clone(&rx_cmd_out);
 
-        let (tx_err, mut rx_err) = tokio::sync::mpsc::channel::<Result<(), ClientError>>(1);
+        let (tx_err, mut rx_err) = tokio::sync::mpsc::channel::<Result<(), HostError>>(1);
 
         // handle stdin and stdout
         let handle_std_in_out =
@@ -106,9 +103,9 @@ where
 
         let handle_read = tokio::spawn(async move {
             let res = read
-                .map_err(|err| ClientError::TungsteniteReadData { err })
+                .map_err(|err| HostError::TungsteniteReadData { err })
                 .try_for_each(|cmd_out| async {
-                    tx_cmd_out.send(cmd_out).map_err(ClientError::Channel)
+                    tx_cmd_out.send(cmd_out).map_err(HostError::Channel)
                 })
                 .await;
 
@@ -137,8 +134,8 @@ where
     async fn read_write(
         write: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
         rx: Arc<Mutex<UnboundedReceiver<Message>>>,
-        tx_err: Sender<Result<(), ClientError>>,
-    ) -> Result<(), ClientError> {
+        tx_err: Sender<Result<(), HostError>>,
+    ) -> Result<(), HostError> {
         let mut iohandler = IOHandler::new(write, tx_err);
 
         // read from stdin and, if messages are present on the channel (rx) print them to the stdout
@@ -154,9 +151,9 @@ where
 
     #[instrument(skip_all)]
     async fn close(
-        handles: &mut [JoinHandle<Result<(), ClientError>>],
+        handles: &mut [JoinHandle<Result<(), HostError>>],
         rx_cmd_out: Arc<Mutex<UnboundedReceiver<Message>>>,
-    ) -> Result<(), ClientError> {
+    ) -> Result<(), HostError> {
         // abort the current active tasks
         for h in handles.iter() {
             h.abort();
@@ -184,11 +181,11 @@ where
             stdout
                 .write(&data)
                 .await
-                .map_err(|err| ClientError::IOWrite { err })?;
+                .map_err(|err| HostError::IOWrite { err })?;
             stdout
                 .flush()
                 .await
-                .map_err(|err| ClientError::IOWrite { err })?;
+                .map_err(|err| HostError::IOWrite { err })?;
         }
 
         info!("Client terminated");
@@ -206,14 +203,14 @@ pub struct TcpClientConnector {
 #[async_trait]
 impl ClientConnect for TcpClientConnector {
     #[instrument(skip(self))]
-    async fn connect(&mut self) -> Result<(), ClientError> {
+    async fn connect(&mut self) -> Result<(), HostError> {
         use tokio_tungstenite::connect_async;
         // Websocket connection to an existing server
         let (ws_stream, _) = connect_async(self.listener_url.clone())
             .await
             .map_err(|err| {
                 error!("Websocket error: {:?}", err);
-                ClientError::WebSocketConnect(err)
+                HostError::WebSocketConnect(err)
             })?;
 
         info!("WebSocket handshake has been successfully completed on a NON-TLS protected stream");
@@ -231,7 +228,7 @@ impl ClientConnect for TcpClientConnector {
 
 // TODO: CAPIRE SE SPOSTARE METODI DENTRO LA STRUCT CLIENT
 impl TcpClientConnector {
-    pub async fn new(listener_url: Url) -> Result<Self, ClientError> {
+    pub async fn new(listener_url: Url) -> Result<Self, HostError> {
         Ok(Self {
             listener_url,
             ws_stream: None,
