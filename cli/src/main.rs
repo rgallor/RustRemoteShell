@@ -1,13 +1,15 @@
 use clap::{Parser, Subcommand};
-use rust_remote_shell::service::Device;
+
 use std::net::SocketAddr;
 
 use color_eyre::Result;
 
-use tracing::Level;
+use tracing::{debug, Level};
 use tracing_subscriber::FmtSubscriber;
 
+use rust_remote_shell::device::Device;
 use rust_remote_shell::device_server::{Server, TcpConnector};
+use rust_remote_shell::host::Host;
 use rust_remote_shell::sender_client::{Client, ClientConnect, TcpClientConnector};
 
 /// CLI for a rust remote shell
@@ -68,6 +70,8 @@ async fn main() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
     let cli = Cli::parse();
+
+    debug!(?cli);
 
     match cli.command {
         Commands::Listener {
@@ -131,7 +135,7 @@ async fn main() -> Result<()> {
             server_cert_file,
             privkey_file,
         } => {
-            let builder = rust_remote_shell::service::Host::bind(addr).await;
+            let builder = Host::bind(addr).await;
 
             if tls_enabled {
                 println!("TLS");
@@ -152,11 +156,11 @@ async fn main() -> Result<()> {
                 builder
                     .with_tls(cert, privkey)
                     .await
-                    .serve(tower::service_fn(rust_remote_shell::service::host_handle))
+                    .serve(tower::service_fn(rust_remote_shell::host::host_handle))
                     .await;
             } else {
                 builder
-                    .serve(tower::service_fn(rust_remote_shell::service::host_handle))
+                    .serve(tower::service_fn(rust_remote_shell::host::host_handle))
                     .await;
             }
         }
@@ -181,7 +185,7 @@ async fn main() -> Result<()> {
             device
                 .connect(
                     ca_cert,
-                    tower::service_fn(rust_remote_shell::service::device_handle),
+                    tower::service_fn(rust_remote_shell::device::device_handle),
                 )
                 .await;
         }

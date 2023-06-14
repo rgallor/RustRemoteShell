@@ -16,8 +16,8 @@ use tracing::{debug, error, info, instrument};
 use url::Url;
 
 use crate::device_server::{Connect, ServerError, TcpConnector};
+use crate::host::HostBuilder;
 use crate::sender_client::{ClientConnect, ClientError, TcpClientConnector};
-use crate::service::HostBuilder;
 
 pub struct TlsConnector {
     listener: TcpConnector,
@@ -158,7 +158,7 @@ pub async fn client_tls_config(ca_cert: Vec<u8>) -> Connector {
 }
 
 pub async fn connect(
-    url: Url,
+    url: &Url,
     connector: Option<Connector>,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, ClientError> {
     let (ws_stream, _) = connect_async_tls_with_config(url, None, connector)
@@ -198,7 +198,6 @@ where
         let mut inner = std::mem::replace(&mut self.service, clone);
         Box::pin(async move {
             let stream = acceptor.accept(req).await.expect("err");
-
             inner.call(stream).await
         })
     }
