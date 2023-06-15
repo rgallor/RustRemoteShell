@@ -74,7 +74,7 @@ where
         self.write
             .send(Message::Close(None))
             .await
-            .map_err(|err| HostError::TungsteniteClose { err })?;
+            .map_err(HostError::TungsteniteClose)?;
         info!("Closed websocket on client side");
 
         self.tx_err.send(Ok(())).await.expect("channel error");
@@ -93,7 +93,7 @@ where
         self.write
             .send(Message::Binary(self.buf_cmd.as_bytes().to_vec()))
             .await
-            .map_err(|err| HostError::TungsteniteReadData { err })?;
+            .map_err(HostError::TungsteniteReadData)?;
 
         info!("Command sent: {}", self.buf_cmd);
 
@@ -123,15 +123,9 @@ where
     async fn impl_write_stdout(&mut self, msg: Message) -> Result<(), HostError> {
         let data = msg.into_data();
 
-        self.stdout
-            .write(&data)
-            .await
-            .map_err(|err| HostError::IOWrite { err })?;
+        self.stdout.write(&data).await.map_err(HostError::IOWrite)?;
 
-        self.stdout
-            .flush()
-            .await
-            .map_err(|err| HostError::IOWrite { err })?;
+        self.stdout.flush().await.map_err(HostError::IOWrite)?;
 
         Ok(())
     }

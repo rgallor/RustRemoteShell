@@ -26,9 +26,9 @@ enum Commands {
         #[clap(long, requires("server-cert-file"), requires("privkey-file"))]
         tls_enabled: bool,
         #[clap(long)]
-        server_cert_file: Option<String>, // "certs/localhost.local.der" // TODO:: check if Path can be used rather then String
+        server_cert_file: Option<String>, // "certs/localhost.local.der"
         #[clap(long)]
-        privkey_file: Option<String>, // "certs/localhost.local.key.der" // TODO:: check if Path can be used rather then String
+        privkey_file: Option<String>, // "certs/localhost.local.key.der"
     },
     /// Device capable of receiving commands and sending their output
     Device {
@@ -36,7 +36,7 @@ enum Commands {
         #[clap(long, requires("ca-cert-file"))]
         tls_enabled: bool,
         #[clap(long)]
-        ca_cert_file: Option<String>, // "certs/CA.der" // TODO:: check if Path can be used rather then String
+        ca_cert_file: Option<String>, // "certs/CA.der"
     },
 }
 
@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
             server_cert_file,
             privkey_file,
         } => {
-            let builder = Host::bind(addr).await;
+            let builder = Host::bind(addr).await?;
 
             if tls_enabled {
                 println!("TLS");
@@ -80,15 +80,9 @@ async fn main() -> Result<()> {
                 .await
                 .expect("error while reading server private key");
 
-                builder
-                    .with_tls(cert, privkey)
-                    .await
-                    .serve(tower::service_fn(rust_remote_shell::host::host_handle))
-                    .await;
+                builder.with_tls(cert, privkey).await?.serve().await?;
             } else {
-                builder
-                    .serve(tower::service_fn(rust_remote_shell::host::host_handle))
-                    .await;
+                builder.serve().await?;
             }
         }
         Commands::Device {
@@ -109,12 +103,7 @@ async fn main() -> Result<()> {
                 );
             }
 
-            device
-                .connect(
-                    ca_cert,
-                    tower::service_fn(rust_remote_shell::device::device_handle),
-                )
-                .await;
+            device.connect(ca_cert).await?;
         }
     }
 

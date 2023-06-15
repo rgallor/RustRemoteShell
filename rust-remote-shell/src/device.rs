@@ -1,52 +1,32 @@
-use std::{fmt::Debug, future, string::FromUtf8Error};
+use std::{fmt::Debug, future, io::ErrorKind, string::FromUtf8Error};
 
 use futures::{SinkExt, StreamExt, TryStreamExt};
 use thiserror::Error;
-use tokio::{
-    io::{self, AsyncRead, AsyncWrite},
-    net::TcpStream,
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{error::ProtocolError, Message},
+    WebSocketStream,
 };
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
-use tower::Service;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use url::Url;
 
-use crate::shell::{CommandHandler, ShellError};
+use crate::shell::CommandHandler;
 #[cfg(feature = "tls")]
 use crate::tls;
 
 #[derive(Error, Debug)]
 pub enum DeviceError {
-    #[error("Failed to bind")]
-    Bind(#[from] io::Error),
-    #[error("Failed to accept a new connection")]
-    AcceptConnection {
-        #[source]
-        err: io::Error,
-    },
-    #[error("Failed to read {file} from file")]
-    ReadFile {
-        #[source]
-        err: io::Error,
-        file: String,
-    },
-    #[error("Connected streams should have a peer address")]
-    PeerAddr,
-    #[error("Error during the websocket handshake occurred")]
-    WebSocketHandshake,
     #[error("Error while reading the shell command from websocket")]
     ReadCommand,
     #[error("Error marshaling to UTF8")]
     Utf8Error(#[from] FromUtf8Error),
     #[error("Trasport error from Tungstenite")]
     Transport(#[from] tokio_tungstenite::tungstenite::Error),
-    #[error("Error while precessing the shell command")]
-    ShellError(#[from] ShellError),
+    #[error("Error while trying to connect with server")]
+    WebSocketConnect(#[source] tokio_tungstenite::tungstenite::Error),
     #[error("Close websocket connection")]
     CloseWebsocket,
-    #[error("Error while establishing a TLS connection")]
-    #[cfg(feature = "tls")]
-    RustTls(#[from] tokio_rustls::rustls::Error),
 }
 
 #[derive(Clone, Debug)]
@@ -59,10 +39,8 @@ impl Device {
         Self { url }
     }
 
-    pub async fn connect<S, E, C>(&mut self, ca_cert: Option<C>, mut service: S)
+    pub async fn connect<C>(&mut self, ca_cert: Option<C>) -> Result<(), DeviceError>
     where
-        S: Service<WebSocketStream<MaybeTlsStream<TcpStream>>, Error = E> + Clone + 'static,
-        E: Debug,
         C: Into<Vec<u8>>,
     {
         let ws_stream = match ca_cert {
@@ -70,12 +48,18 @@ impl Device {
             Some(ca_cert) => {
                 let connector = tls::client_tls_config(ca_cert.into()).await; // Connector::Rustls
 
-                tls::connect(&self.url, Some(connector)).await.expect("err")
+                tls::connect(&self.url, Some(connector)).await?
             }
-            _ => connect_async(&self.url).await.expect("err").0,
+            _ => {
+                let (ws_stream, _) = connect_async(&self.url).await.map_err(|err| {
+                    error!("Websocket error: {:?}", err);
+                    DeviceError::WebSocketConnect(err)
+                })?;
+                ws_stream
+            }
         };
 
-        service.call(ws_stream).await.expect("err");
+        device_handle(ws_stream).await
     }
 }
 
@@ -84,40 +68,12 @@ pub async fn device_handle<U>(stream: WebSocketStream<U>) -> Result<(), DeviceEr
 where
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    // let (write, read) = stream.split();
-
-    // let _ = read
-    //     .map_err(ServerError::Transport)
-    //     .and_then(|msg| {
-    //         let cmd = match msg {
-    //             // convert the message from a Vec<u8> into a OsString
-    //             Message::Binary(v) => String::from_utf8(v).map_err(ServerError::Utf8Error),
-    //             Message::Close(_) => Err(ServerError::CloseWebsocket), // the client closed the connection
-    //             _ => Err(ServerError::ReadCommand),
-    //         };
-
-    //         future::ready(cmd)
-    //     })
-    //     .and_then(|cmd| async move {
-    //         // define a command handler
-    //         let cmd_handler = CommandHandler::new();
-
-    //         // execute the command and eventually return the error
-    //         let cmd_out = cmd_handler
-    //             .execute(cmd)
-    //             .await
-    //             .unwrap_or_else(|err| format!("Shell error: {}\n", err));
-
-    //         Ok(Message::Binary(cmd_out.as_bytes().to_vec()))
-    //     })
-    //     .forward(write.sink_map_err(ServerError::Transport))
-    //     .await;
-
     // separate ownership between receiving and writing part
     let (write, read) = stream.split();
 
     // Read the received command
-    read.map_err(DeviceError::Transport)
+    let res = read
+        .map_err(DeviceError::Transport)
         .and_then(|msg| {
             let cmd = match msg {
                 // convert the message from a Vec<u8> into a OsString
@@ -130,7 +86,7 @@ where
         })
         .and_then(|cmd| async move {
             // define a command handler
-            let cmd_handler = CommandHandler::new();
+            let cmd_handler = CommandHandler::default();
 
             // execute the command and eventually return the error
             let cmd_out = cmd_handler.execute(cmd).await.unwrap_or_else(|err| {
@@ -142,7 +98,26 @@ where
             Ok(Message::Binary(cmd_out.as_bytes().to_vec()))
         })
         .forward(write.sink_map_err(DeviceError::Transport))
-        .await?;
+        .await;
 
-    Ok(())
+    match res {
+        Ok(()) => Ok(()),
+        Err(DeviceError::CloseWebsocket)
+        | Err(DeviceError::Transport(tokio_tungstenite::tungstenite::Error::Protocol(
+            ProtocolError::ResetWithoutClosingHandshake,
+        ))) => {
+            warn!("Websocket connection closed");
+            Ok(())
+        }
+        Err(DeviceError::Transport(tokio_tungstenite::tungstenite::Error::Io(err)))
+            if err.kind() == ErrorKind::UnexpectedEof =>
+        {
+            warn!("Websocket connection closed");
+            Ok(())
+        }
+        Err(err) => {
+            error!("Fatal error occurred: {}", err);
+            Err(err)
+        }
+    }
 }
