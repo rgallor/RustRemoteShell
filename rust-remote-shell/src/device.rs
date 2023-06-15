@@ -1,4 +1,4 @@
-use std::{fmt::Debug, future, io::ErrorKind, string::FromUtf8Error};
+use std::{fmt::Debug, io::ErrorKind, string::FromUtf8Error};
 
 use futures::{SinkExt, StreamExt, TryStreamExt};
 use thiserror::Error;
@@ -74,15 +74,14 @@ where
     // Read the received command
     let res = read
         .map_err(DeviceError::Transport)
-        .and_then(|msg| {
-            let cmd = match msg {
+        .and_then(|msg| async move {
+            info!("Received command from the client");
+            match msg {
                 // convert the message from a Vec<u8> into a OsString
                 Message::Binary(v) => String::from_utf8(v).map_err(DeviceError::Utf8Error),
                 Message::Close(_) => Err(DeviceError::CloseWebsocket), // the client closed the connection
                 _ => Err(DeviceError::ReadCommand),
-            };
-            info!("Received command from the client");
-            future::ready(cmd)
+            }
         })
         .and_then(|cmd| async move {
             // define a command handler
