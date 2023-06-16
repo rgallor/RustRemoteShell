@@ -1,13 +1,11 @@
 use std::net::SocketAddr;
 
 use clap::{Parser, Subcommand};
-
 use color_eyre::Result;
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
-use rust_remote_shell::device_server::DeviceServer;
-use rust_remote_shell::sender_client::SenderClient;
+use rust_remote_shell::{device_server::DeviceServer, sender_client::SenderClient};
 
 /// CLI for a rust remote shell
 #[derive(Debug, Parser)]

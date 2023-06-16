@@ -26,11 +26,6 @@ pub enum ShellError {
 pub struct CommandHandler;
 
 impl CommandHandler {
-    pub fn new() -> Self {
-        Self::default()
-        // TODO: open a remote shell (to the input IP addr)
-    }
-
     #[instrument(skip(self))]
     pub async fn execute(&self, cmd: String) -> Result<String, ShellError> {
         debug!("Execute command {}", cmd);

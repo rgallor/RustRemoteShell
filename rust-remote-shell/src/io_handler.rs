@@ -39,7 +39,7 @@ impl IOHandler {
     pub async fn read_stdin(&mut self) -> Result<(), SenderClientError> {
         self.buf_cmd.clear();
 
-        // read a shell command into the stdin and send it to the server
+        // read a shell command from the stdin and send it to the server
         let byte_read = self
             .reader
             .read_line(&mut self.buf_cmd)
@@ -105,6 +105,7 @@ impl IOHandler {
 
         self.impl_write_stdout(msg).await?;
 
+        // if the channel still contains information, empty it before aborting the task
         self.empty_buffer(channel).await?;
 
         Ok(())

@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::string::FromUtf8Error;
 use std::sync::Arc;
 
-use futures::{future, SinkExt, StreamExt, TryStreamExt};
+use futures::{SinkExt, StreamExt, TryStreamExt};
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -140,21 +140,20 @@ impl DeviceServer {
 
         // Read the received command
         read.map_err(DeviceServerError::Transport)
-            .and_then(|msg| {
-                let cmd = match msg {
+            .and_then(|msg| async move {
+                info!("Received command from the client");
+                match msg {
                     // convert the message from a Vec<u8> into a OsString
                     Message::Binary(v) => {
                         String::from_utf8(v).map_err(DeviceServerError::Utf8Error)
                     }
                     Message::Close(_) => Err(DeviceServerError::CloseWebsocket), // the client closed the connection
                     _ => Err(DeviceServerError::ReadCommand),
-                };
-                info!("Received command from the client");
-                future::ready(cmd)
+                }
             })
             .and_then(|cmd| async move {
                 // define a command handler
-                let cmd_handler = CommandHandler::new();
+                let cmd_handler = CommandHandler::default();
 
                 // execute the command and eventually return the error
                 let cmd_out = cmd_handler.execute(cmd).await.unwrap_or_else(|err| {
