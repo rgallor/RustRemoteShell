@@ -11,6 +11,18 @@ use tokio_tungstenite::{
 use tracing::{error, info, warn};
 use url::Url;
 
+/*
+STEP
+1. register the device with rust sdk
+    a. import trait
+    b. add device id
+    c. configure it
+    d. connect
+2. add server-owned interface to astarte
+3. send data with  "astartectl appengine --appengine-url http://localhost:4002/ --realm-management-url http://localhost:4000/ --realm-key test_private.pem --realm-name test devices send-data 2TBn-jNESuuHamE2Zo1anA <INTERFACE_NAME> <ENDPOINT> <VALUE>"
+4. device must receive the data (IP + PORT) and use them
+ */
+
 use crate::shell::CommandHandler;
 #[cfg(feature = "tls")]
 use crate::tls;
