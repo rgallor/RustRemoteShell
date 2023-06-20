@@ -8,13 +8,13 @@
     "description": "IP and port configuration necessary to open a remote shell from a device to a certain host",
     "mappings": [
         {
-            "endpoint": "host/ip",
+            "endpoint": "/host/ip",
             "type": "string",
             "explicit_timestamp": true,
             "description": "send the IP address the device must connect to"
         },
         {
-            "endpoint": "host/port",
+            "endpoint": "/host/port",
             "type": "integer",
             "explicit_timestamp": true,
             "description": "send the port the device must connect to"
