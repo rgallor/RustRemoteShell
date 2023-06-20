@@ -75,6 +75,7 @@ impl Host {
         loop {
             // wait for a connection from a device
             let (stream, _) = self.listener.accept().await.map_err(HostError::Listen)?;
+            info!("Connection accepted.");
             // handle the connection by sending messages and printing out responses from the device
             service.call(stream).await?;
         }

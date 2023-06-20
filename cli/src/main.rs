@@ -32,7 +32,7 @@ enum Commands {
     },
     /// Device capable of receiving commands and sending their output
     Device {
-        listener_addr: url::Url,
+        device_cfg_path: String,
         #[clap(long, requires("ca-cert-file"))]
         tls_enabled: bool,
         #[clap(long)]
@@ -86,11 +86,13 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Device {
-            listener_addr,
+            device_cfg_path,
             tls_enabled,
             ca_cert_file,
         } => {
-            let mut device = Device::new(listener_addr);
+            // To make comminicate a device with Astarte use the following command
+            // astartectl appengine --appengine-url http://localhost:4002/ --realm-management-url http://localhost:4000/ --realm-key test_private.pem --realm-name test devices send-data 2TBn-jNESuuHamE2Zo1anA org.astarte-platform.rust-remote-shell.ConnectToHost /host '{"ip" : "127.0.0.1", "port" : 8080}'
+            let mut device = Device::new(device_cfg_path.as_str()).await?;
             let mut ca_cert: Option<Vec<u8>> = None;
 
             if tls_enabled {

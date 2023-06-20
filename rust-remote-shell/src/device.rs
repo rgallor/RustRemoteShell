@@ -11,18 +11,7 @@ use tokio_tungstenite::{
 use tracing::{error, info, warn};
 use url::Url;
 
-/*
-STEP
-1. register the device with rust sdk
-    a. import trait
-    b. add device id
-    c. configure it
-    d. connect
-2. add server-owned interface to astarte
-3. send data with  "astartectl appengine --appengine-url http://localhost:4002/ --realm-management-url http://localhost:4000/ --realm-key test_private.pem --realm-name test devices send-data 2TBn-jNESuuHamE2Zo1anA <INTERFACE_NAME> <ENDPOINT> <VALUE>"
-4. device must receive the data (IP + PORT) and use them
- */
-
+use crate::astarte::{Error as DeviceAstarteError, HandleAstarteConnection};
 use crate::shell::CommandHandler;
 #[cfg(feature = "tls")]
 use crate::tls;
@@ -39,6 +28,9 @@ pub enum DeviceError {
     WebSocketConnect(#[source] tokio_tungstenite::tungstenite::Error),
     #[error("Close websocket connection")]
     CloseWebsocket,
+
+    #[error("Astarte error, {0}")]
+    Astarte(DeviceAstarteError),
 }
 
 #[derive(Clone, Debug)]
@@ -47,8 +39,44 @@ pub struct Device {
 }
 
 impl Device {
-    pub fn new(url: Url) -> Self {
-        Self { url }
+    pub async fn new(device_cfg_path: &str) -> Result<Self, DeviceError> {
+        let handle_astarte = HandleAstarteConnection;
+
+        let cfg = handle_astarte
+            .read_device_config(device_cfg_path)
+            .await
+            .map_err(DeviceError::Astarte)?;
+
+        let mut device = handle_astarte
+            .create_astarte_device(&cfg)
+            .await
+            .map_err(DeviceError::Astarte)?;
+
+        info!("Connection to Astarte established.");
+
+        // wait for an aggregate datastream containing IP and port to connect to
+        // TODO: loop over handle_events. If a 2nd event arrives while the device is still handling the 1st, queue it so that it can be managed later or do something else
+        match device.handle_events().await {
+            Ok(data) => {
+                if let astarte_device_sdk::Aggregation::Object(map) = data.data {
+                    let url = handle_astarte
+                        .retrieve_url(map)
+                        .map_err(DeviceError::Astarte)?;
+                    info!("Connecting to {}", url);
+                    Ok(Self { url })
+                } else {
+                    Err(DeviceError::Astarte(
+                        DeviceAstarteError::AstarteWrongAggregation,
+                    ))
+                }
+            }
+            Err(err) => {
+                error!("Astarte error: {:?}", err);
+                Err(DeviceError::Astarte(
+                    DeviceAstarteError::AstarteHandleEvent(err),
+                ))
+            }
+        }
     }
 
     pub async fn connect<C>(&mut self, ca_cert: Option<C>) -> Result<(), DeviceError>

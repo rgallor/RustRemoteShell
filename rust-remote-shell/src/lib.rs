@@ -1,3 +1,4 @@
+pub mod astarte;
 pub mod device;
 pub mod host;
 pub mod io_handler;
