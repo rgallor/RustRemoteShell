@@ -39,8 +39,9 @@ pub struct DeviceConfig {
 
 #[derive(Debug)]
 pub struct DataAggObject {
+    scheme: String,
     ip: String,
-    port: i32,
+    port: i32, // TODO: change into u16
 }
 
 impl AstarteAggregate for DataAggObject {
@@ -51,6 +52,7 @@ impl AstarteAggregate for DataAggObject {
         AstarteError,
     > {
         let mut hm = HashMap::new();
+        hm.insert("scheme".to_string(), self.scheme.try_into()?);
         hm.insert("ip".to_string(), self.ip.try_into()?);
         hm.insert("port".to_string(), self.port.try_into()?);
         Ok(hm)
@@ -61,8 +63,15 @@ impl TryFrom<DataAggObject> for Url {
     type Error = Error;
 
     fn try_from(value: DataAggObject) -> Result<Self, Self::Error> {
-        Url::parse(&format!("ws://{}:{}", value.ip, value.port))
+        Url::parse(&format!("{}://{}:{}", value.scheme, value.ip, value.port))
             .map_err(|_| Error::ParseUrl("incorrect format"))
+            .and_then(|url| match url.scheme() {
+                "ws" | "wss" => Ok(url),
+                scheme => Err(Error::ParseUrl(Box::leak(Box::new(format!(
+                    "unsupported scheme, {}",
+                    scheme
+                ))))),
+            })
     }
 }
 
@@ -102,18 +111,20 @@ impl HandleAstarteConnection {
     }
 
     pub fn retrieve_url(&self, map: HashMap<String, AstarteType>) -> Result<Url, Error> {
+        let scheme = map.get("scheme").ok_or(Error::ParseUrl("Missing scheme"))?;
         let ip = map.get("ip").ok_or(Error::ParseUrl("Missing IP address"))?;
         let port = map
             .get("port")
             .ok_or(Error::ParseUrl("Missing port value"))?;
 
-        let data = match (ip, port) {
-            (AstarteType::String(ip), AstarteType::Integer(port)) => {
+        let data = match (scheme, ip, port) {
+            (AstarteType::String(scheme), AstarteType::String(ip), AstarteType::Integer(port)) => {
                 // build a socket to check if the IP and the port number are correct
                 let _socket = SocketAddrV4::from_str(&format!("{ip}:{port}"))
                     .map_err(|_| Error::ParseUrl("Received a wrong IP address or port"))?;
 
                 DataAggObject {
+                    scheme: scheme.to_string(),
                     ip: ip.to_string(),
                     port: *port,
                 }
