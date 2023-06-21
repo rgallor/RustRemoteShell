@@ -18,6 +18,7 @@ tokio-tungstenite = "0.18.0"
 tracing = "0.1.37"
 url = "2.3.1"
 rustls-pemfile = {version = "1.0.2", optional = true }
+webpki-roots = {version = "0.23.1", optional = true }
 async-trait = "0.1.68"
 tower = "0.4.13"
 serde = "1.0.164"
@@ -31,6 +32,7 @@ openssl-src = "=111.24.0"
 
 
 
+
 [features]
 default = ["tls"]
-tls = ["tokio-tungstenite/rustls-tls-native-roots", "tokio-rustls", "rustls-pemfile"]
+tls = ["tokio-tungstenite/rustls-tls-native-roots", "tokio-rustls", "webpki-roots", "rustls-pemfile"]

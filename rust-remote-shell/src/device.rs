@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::{fmt::Debug, io::ErrorKind, string::FromUtf8Error};
 
 use futures::{SinkExt, StreamExt, TryStreamExt};
@@ -30,6 +31,10 @@ pub enum DeviceError {
     CloseWebsocket,
     #[error("Wrong scheme, {0}")]
     WrongScheme(String),
+    #[error("Error while reading from file")]
+    ReadFile(#[from] std::io::Error),
+    #[error("Wrong item")]
+    WrongItem,
     #[error("Astarte error, {}", msg)]
     Astarte {
         #[source]
@@ -97,13 +102,10 @@ impl Device {
     }
 
     #[cfg(feature = "tls")]
-    pub async fn connect_tls<C>(&mut self, ca_cert: C) -> Result<(), DeviceError>
-    where
-        C: Into<Vec<u8>>,
-    {
+    pub async fn connect_tls(&mut self, ca_cert_file: Option<PathBuf>) -> Result<(), DeviceError> {
         let ws_stream = match self.url.scheme() {
             "wss" => {
-                let connector = tls::client_tls_config(ca_cert.into()).await; // Connector::Rustls
+                let connector = tls::client_tls_config(ca_cert_file).await?; // Connector::Rustls
                 tls::connect(&self.url, Some(connector)).await?
             }
             scheme => {

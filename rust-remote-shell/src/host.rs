@@ -1,5 +1,6 @@
 use std::fmt::Debug;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -30,13 +31,19 @@ pub enum HostError {
     #[error("Error while trying to connect with server")]
     WebSocketConnect(#[from] tokio_tungstenite::tungstenite::Error),
     #[error("IO error occurred while reading from stdin")]
-    IORead(#[from] std::io::Error),
+    IORead(#[source] std::io::Error),
     #[error("Failed to bind")]
     Bind(#[source] std::io::Error),
     #[error("Failed to accept a new connection")]
     Listen(#[source] std::io::Error),
     #[error("IO error occurred while writing to stdout")]
     IOWrite(#[source] std::io::Error),
+    #[error("Error while reading from file {file}")]
+    ReadFile {
+        #[source]
+        err: std::io::Error,
+        file: PathBuf,
+    },
     #[error("Error while trying to send the output of a command to the main task")]
     ChannelMsg(#[from] SendError<Message>),
     #[error("Error from Tungstenite while reading command")]
@@ -51,6 +58,8 @@ pub enum HostError {
     #[cfg(feature = "tls")]
     #[error("Error while accepting a TLS connection")]
     AcceptTls(#[source] std::io::Error),
+    #[error("Wrong item")]
+    WrongItem,
 }
 
 pub struct Host {
@@ -95,16 +104,12 @@ impl<L> HostBuilder<L> {
 
 impl HostBuilder<Identity> {
     #[cfg(feature = "tls")]
-    pub async fn with_tls<C, P>(
+    pub async fn with_tls(
         self,
-        cert: C,
-        privkey: P,
-    ) -> Result<HostBuilder<Stack<TlsLayer, Identity>>, HostError>
-    where
-        C: Into<Vec<u8>>,
-        P: Into<Vec<u8>>,
-    {
-        let acceptor = tls::acceptor(cert, privkey).await?;
+        host_cert_file: PathBuf,
+        privkey_file: PathBuf,
+    ) -> Result<HostBuilder<Stack<TlsLayer, Identity>>, HostError> {
+        let acceptor = tls::acceptor(host_cert_file, privkey_file).await?;
 
         Ok(HostBuilder {
             server: self.server,

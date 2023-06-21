@@ -1,10 +1,16 @@
 use futures::Future;
 
+use rustls_pemfile::{read_all, read_one, Item};
+use std::io::BufReader;
+
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio_rustls::rustls::{Certificate, ClientConfig, PrivateKey, RootCertStore};
+use tokio_rustls::rustls::{
+    Certificate, ClientConfig, OwnedTrustAnchor, PrivateKey, RootCertStore,
+};
 use tokio_rustls::{server::TlsStream, TlsAcceptor};
 use tokio_tungstenite::{
     connect_async_tls_with_config, Connector, MaybeTlsStream, WebSocketStream,
@@ -39,29 +45,73 @@ where
     Ok(config)
 }
 
-pub async fn acceptor<C, P>(cert: C, privkey: P) -> Result<TlsAcceptor, HostError>
-where
-    C: Into<Vec<u8>>,
-    P: Into<Vec<u8>>,
-{
-    let acceptor = TlsAcceptor::from(Arc::new(server_tls_config(cert, privkey).await?));
+pub async fn acceptor(
+    host_cert_file: PathBuf,
+    privkey_file: PathBuf,
+) -> Result<TlsAcceptor, HostError> {
+    let cert_item = retrieve_item(&host_cert_file).map_err(|err| HostError::ReadFile {
+        err,
+        file: host_cert_file,
+    })?;
+    let cert = match cert_item {
+        Some(Item::X509Certificate(ca_cert)) => ca_cert,
+        _ => return Err(HostError::WrongItem),
+    };
 
+    let privkey_item = retrieve_item(&privkey_file).map_err(|err| HostError::ReadFile {
+        err,
+        file: privkey_file,
+    })?;
+    let privkey = match privkey_item {
+        Some(Item::PKCS8Key(privkey)) => privkey,
+        _ => return Err(HostError::WrongItem),
+    };
+
+    let acceptor = TlsAcceptor::from(Arc::new(server_tls_config(cert, privkey).await?));
     Ok(acceptor)
 }
 
-pub async fn client_tls_config(ca_cert: Vec<u8>) -> Connector {
+fn retrieve_item(file: &Path) -> Result<Option<Item>, std::io::Error> {
+    std::fs::File::open(file)
+        .map(BufReader::new)
+        .and_then(|mut reader| read_one(&mut reader))
+}
+
+pub async fn client_tls_config(ca_cert_file: Option<PathBuf>) -> Result<Connector, DeviceError> {
     let mut root_certs = RootCertStore::empty();
-    let cert = Certificate(ca_cert); // TODO: passare una Option e se il cert non viene passato usare webpki
-    root_certs
-        .add(&cert)
-        .expect("failed to add CA cert to the root certs");
+
+    if let Some(ca_cert_file) = ca_cert_file {
+        let file = std::fs::File::open(ca_cert_file).map_err(DeviceError::ReadFile)?;
+        let mut reader = BufReader::new(file);
+
+        for item in read_all(&mut reader).map_err(DeviceError::ReadFile)? {
+            match item {
+                Item::X509Certificate(ca_cert) => {
+                    let cert = Certificate(ca_cert);
+                    debug!("{:?}", cert);
+                    root_certs
+                        .add(&cert)
+                        .expect("failed to add CA cert to the root certs");
+                }
+                _ => return Err(DeviceError::WrongItem),
+            }
+        }
+    };
+
+    root_certs.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
+        OwnedTrustAnchor::from_subject_spki_name_constraints(
+            ta.subject,
+            ta.spki,
+            ta.name_constraints,
+        )
+    }));
 
     let config = ClientConfig::builder()
         .with_safe_defaults()
         .with_root_certificates(root_certs)
         .with_no_client_auth();
 
-    Connector::Rustls(Arc::new(config))
+    Ok(Connector::Rustls(Arc::new(config)))
 }
 
 pub async fn connect(
@@ -70,7 +120,10 @@ pub async fn connect(
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, DeviceError> {
     let (ws_stream, _) = connect_async_tls_with_config(url, None, connector)
         .await
-        .map_err(DeviceError::WebSocketConnect)?;
+        .map_err(|err| {
+            tracing::error!(?err);
+            DeviceError::WebSocketConnect(err)
+        })?;
 
     Ok(ws_stream)
 }
