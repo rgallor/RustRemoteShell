@@ -1,9 +1,4 @@
-use std::{
-    collections::HashMap,
-    fmt::Display,
-    net::{AddrParseError, IpAddr},
-    num::TryFromIntError,
-};
+use std::{collections::HashMap, fmt::Display, net::AddrParseError, num::TryFromIntError};
 
 use astarte_device_sdk::{
     options::{AstarteOptions, AstarteOptionsError},
@@ -12,6 +7,7 @@ use astarte_device_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::debug;
 use url::Url;
 
 #[derive(Error, Debug)]
@@ -77,10 +73,10 @@ impl TryFrom<&str> for Scheme {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DataAggObject {
     scheme: Scheme,
-    ip: IpAddr, // TODO: host: url:Host
+    host: url::Host,
     port: u16,
 }
 
@@ -93,7 +89,7 @@ impl AstarteAggregate for DataAggObject {
     > {
         let mut hm = HashMap::new();
         hm.insert("scheme".to_string(), self.scheme.to_string().try_into()?);
-        hm.insert("ip".to_string(), self.ip.to_string().try_into()?);
+        hm.insert("host".to_string(), self.host.to_string().try_into()?);
         hm.insert("port".to_string(), AstarteType::Integer(self.port.into()));
         Ok(hm)
     }
@@ -103,11 +99,13 @@ impl TryFrom<DataAggObject> for Url {
     type Error = Error;
 
     fn try_from(value: DataAggObject) -> Result<Self, Self::Error> {
-        let ip = match value.ip {
-            IpAddr::V4(ipv4) if std::net::Ipv4Addr::LOCALHOST == ipv4 => {
+        let ip = match value.host {
+            url::Host::Domain(domain) => domain,
+            // the IP 127.0.0.1 cannot be used due to a low MSRV, therefore the IP is converted to a domain name
+            url::Host::Ipv4(ipv4) if std::net::Ipv4Addr::LOCALHOST == ipv4 => {
                 "localhost.local".to_string()
             }
-            ip => ip.to_string(),
+            host => host.to_string(),
         };
         Url::parse(&format!("{}://{}:{}", value.scheme, ip, value.port)).map_err(Error::Parse)
     }
@@ -152,23 +150,25 @@ impl HandleAstarteConnection {
         let scheme = map
             .get("scheme")
             .ok_or_else(|| Error::MissingUrlInfo("Missing scheme".to_string()))?;
-        let ip = map
-            .get("ip")
-            .ok_or_else(|| Error::MissingUrlInfo("Missing IP address".to_string()))?;
+        let host: &AstarteType = map
+            .get("host")
+            .ok_or_else(|| Error::MissingUrlInfo("Missing host (IP or domain name)".to_string()))?;
         let port = map
             .get("port")
             .ok_or_else(|| Error::MissingUrlInfo("Missing port value".to_string()))?;
 
-        let data = match (scheme, ip, port) {
-            (AstarteType::String(scheme), AstarteType::String(ip), AstarteType::Integer(port)) => {
+        let data = match (scheme, host, port) {
+            (
+                AstarteType::String(scheme),
+                AstarteType::String(host),
+                AstarteType::Integer(port),
+            ) => {
                 let scheme = Scheme::try_from(scheme.as_ref())?;
-                let ip: IpAddr = match ip.as_str() {
-                    "localhost" | "localhost.local" => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                    _ => ip.parse().map_err(Error::ParseAddr)?,
-                };
+                let host = url::Host::parse(host).map_err(Error::Parse)?;
+                debug!("{:?}", host);
                 let port: u16 = (*port).try_into().map_err(Error::ParsePort)?;
 
-                DataAggObject { scheme, ip, port }
+                DataAggObject { scheme, host, port }
             }
             _ => return Err(Error::AstarteWrongType),
         };

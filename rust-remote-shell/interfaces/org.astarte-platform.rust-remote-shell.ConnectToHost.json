@@ -8,17 +8,17 @@
     "description": "IP and port configuration necessary to open a remote shell from a device to a certain host",
     "mappings": [
         {
-            "endpoint": "/host/scheme",
+            "endpoint": "/rshell/scheme",
             "type": "string",
             "description": "send the scheme of the protocol the device must use"
         },
         {
-            "endpoint": "/host/ip",
+            "endpoint": "/rshell/host",
             "type": "string",
-            "description": "send the IP address the device must connect to"
+            "description": "send the IP address or domain name the device must connect to"
         },
         {
-            "endpoint": "/host/port",
+            "endpoint": "/rshell/port",
             "type": "integer",
             "description": "send the port the device must connect to"
         }
