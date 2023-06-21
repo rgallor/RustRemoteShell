@@ -1,4 +1,9 @@
-use std::{collections::HashMap, net::SocketAddrV4, str::FromStr};
+use std::{
+    collections::HashMap,
+    fmt::Display,
+    net::{AddrParseError, IpAddr},
+    num::TryFromIntError,
+};
 
 use astarte_device_sdk::{
     options::{AstarteOptions, AstarteOptionsError},
@@ -25,8 +30,16 @@ pub enum Error {
     ReadFile(#[from] tokio::io::Error),
     #[error("Error while serializing/deserializing with serde")]
     Serde,
-    #[error("Parse url error, {0}")]
-    ParseUrl(&'static str),
+    #[error("Error while parsing url")]
+    Parse(#[from] url::ParseError),
+    #[error("Wrong scheme, {0}")]
+    ParseScheme(String),
+    #[error("Error while parsing the ip address")]
+    ParseAddr(#[from] AddrParseError),
+    #[error("Error while parsing the port number")]
+    ParsePort(#[from] TryFromIntError),
+    #[error("Missing url information")]
+    MissingUrlInfo(String),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -37,11 +50,38 @@ pub struct DeviceConfig {
     pairing_url: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
+enum Scheme {
+    Ws,
+    WsSecure,
+}
+
+impl Display for Scheme {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Scheme::Ws => write!(f, "ws"),
+            Scheme::WsSecure => write!(f, "wss"),
+        }
+    }
+}
+
+impl TryFrom<&str> for Scheme {
+    type Error = Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "ws" => Ok(Self::Ws),
+            "wss" => Ok(Self::WsSecure),
+            _ => Err(Self::Error::ParseScheme(value.to_string())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct DataAggObject {
-    scheme: String,
-    ip: String,
-    port: i32, // TODO: change into u16
+    scheme: Scheme,
+    ip: IpAddr, // TODO: host: url:Host
+    port: u16,
 }
 
 impl AstarteAggregate for DataAggObject {
@@ -52,9 +92,9 @@ impl AstarteAggregate for DataAggObject {
         AstarteError,
     > {
         let mut hm = HashMap::new();
-        hm.insert("scheme".to_string(), self.scheme.try_into()?);
-        hm.insert("ip".to_string(), self.ip.try_into()?);
-        hm.insert("port".to_string(), self.port.try_into()?);
+        hm.insert("scheme".to_string(), self.scheme.to_string().try_into()?);
+        hm.insert("ip".to_string(), self.ip.to_string().try_into()?);
+        hm.insert("port".to_string(), AstarteType::Integer(self.port.into()));
         Ok(hm)
     }
 }
@@ -63,15 +103,13 @@ impl TryFrom<DataAggObject> for Url {
     type Error = Error;
 
     fn try_from(value: DataAggObject) -> Result<Self, Self::Error> {
-        Url::parse(&format!("{}://{}:{}", value.scheme, value.ip, value.port))
-            .map_err(|_| Error::ParseUrl("incorrect format"))
-            .and_then(|url| match url.scheme() {
-                "ws" | "wss" => Ok(url),
-                scheme => Err(Error::ParseUrl(Box::leak(Box::new(format!(
-                    "unsupported scheme, {}",
-                    scheme
-                ))))),
-            })
+        let ip = match value.ip {
+            IpAddr::V4(ipv4) if std::net::Ipv4Addr::LOCALHOST == ipv4 => {
+                "localhost.local".to_string()
+            }
+            ip => ip.to_string(),
+        };
+        Url::parse(&format!("{}://{}:{}", value.scheme, ip, value.port)).map_err(Error::Parse)
     }
 }
 
@@ -111,23 +149,26 @@ impl HandleAstarteConnection {
     }
 
     pub fn retrieve_url(&self, map: HashMap<String, AstarteType>) -> Result<Url, Error> {
-        let scheme = map.get("scheme").ok_or(Error::ParseUrl("Missing scheme"))?;
-        let ip = map.get("ip").ok_or(Error::ParseUrl("Missing IP address"))?;
+        let scheme = map
+            .get("scheme")
+            .ok_or_else(|| Error::MissingUrlInfo("Missing scheme".to_string()))?;
+        let ip = map
+            .get("ip")
+            .ok_or_else(|| Error::MissingUrlInfo("Missing IP address".to_string()))?;
         let port = map
             .get("port")
-            .ok_or(Error::ParseUrl("Missing port value"))?;
+            .ok_or_else(|| Error::MissingUrlInfo("Missing port value".to_string()))?;
 
         let data = match (scheme, ip, port) {
             (AstarteType::String(scheme), AstarteType::String(ip), AstarteType::Integer(port)) => {
-                // build a socket to check if the IP and the port number are correct
-                let _socket = SocketAddrV4::from_str(&format!("{ip}:{port}"))
-                    .map_err(|_| Error::ParseUrl("Received a wrong IP address or port"))?;
+                let scheme = Scheme::try_from(scheme.as_ref())?;
+                let ip: IpAddr = match ip.as_str() {
+                    "localhost" | "localhost.local" => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    _ => ip.parse().map_err(Error::ParseAddr)?,
+                };
+                let port: u16 = (*port).try_into().map_err(Error::ParsePort)?;
 
-                DataAggObject {
-                    scheme: scheme.to_string(),
-                    ip: ip.to_string(),
-                    port: *port,
-                }
+                DataAggObject { scheme, ip, port }
             }
             _ => return Err(Error::AstarteWrongType),
         };

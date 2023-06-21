@@ -91,21 +91,20 @@ async fn main() -> Result<()> {
             ca_cert_file,
         } => {
             // To make comminicate a device with Astarte use the following command
-            // astartectl appengine --appengine-url http://localhost:4002/ --realm-management-url http://localhost:4000/ --realm-key test_private.pem --realm-name test devices send-data 2TBn-jNESuuHamE2Zo1anA org.astarte-platform.rust-remote-shell.ConnectToHost /host '{"ip" : "127.0.0.1", "port" : 8080}'
+            // astartectl appengine --appengine-url http://localhost:4002/ --realm-management-url http://localhost:4000/ --realm-key test_private.pem --realm-name test devices send-data 2TBn-jNESuuHamE2Zo1anA org.astarte-platform.rust-remote-shell.ConnectToHost /host '{"scheme" : "ws", "ip" : "127.0.0.1", "port" : 8080}'
             let mut device = Device::new(device_cfg_path.as_str()).await?;
-            let mut ca_cert: Option<Vec<u8>> = None;
 
             if tls_enabled {
-                ca_cert = Some(
-                    tokio::fs::read(
-                        ca_cert_file.expect("expected to be called with --tls-enabled option"),
-                    )
-                    .await
-                    .expect("error while reading server certificate"),
-                );
-            }
+                let ca_cert = tokio::fs::read(
+                    ca_cert_file.expect("expected to be called with --tls-enabled option"),
+                )
+                .await
+                .expect("error while reading server certificate");
 
-            device.connect(ca_cert).await?;
+                device.connect_tls(ca_cert).await?;
+            } else {
+                device.connect().await?;
+            }
         }
     }
 

@@ -11,7 +11,7 @@ use tokio_tungstenite::{
 use tracing::{error, info, warn};
 use url::Url;
 
-use crate::astarte::{Error as DeviceAstarteError, HandleAstarteConnection};
+use crate::astarte::{Error as AstarteError, HandleAstarteConnection};
 use crate::shell::CommandHandler;
 #[cfg(feature = "tls")]
 use crate::tls;
@@ -28,9 +28,14 @@ pub enum DeviceError {
     WebSocketConnect(#[source] tokio_tungstenite::tungstenite::Error),
     #[error("Close websocket connection")]
     CloseWebsocket,
-
-    #[error("Astarte error, {0}")]
-    Astarte(DeviceAstarteError),
+    #[error("Wrong scheme, {0}")]
+    WrongScheme(String),
+    #[error("Astarte error, {}", msg)]
+    Astarte {
+        #[source]
+        err: AstarteError,
+        msg: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -45,12 +50,18 @@ impl Device {
         let cfg = handle_astarte
             .read_device_config(device_cfg_path)
             .await
-            .map_err(DeviceError::Astarte)?;
+            .map_err(|err| DeviceError::Astarte {
+                err,
+                msg: "wrong device config".to_string(),
+            })?;
 
         let mut device = handle_astarte
             .create_astarte_device(&cfg)
             .await
-            .map_err(DeviceError::Astarte)?;
+            .map_err(|err| DeviceError::Astarte {
+                err,
+                msg: "failed to create the astarte device".to_string(),
+            })?;
 
         info!("Connection to Astarte established.");
 
@@ -59,43 +70,61 @@ impl Device {
         match device.handle_events().await {
             Ok(data) => {
                 if let astarte_device_sdk::Aggregation::Object(map) = data.data {
-                    let url = handle_astarte
-                        .retrieve_url(map)
-                        .map_err(DeviceError::Astarte)?;
+                    let url =
+                        handle_astarte
+                            .retrieve_url(map)
+                            .map_err(|err| DeviceError::Astarte {
+                                err,
+                                msg: "failed to retrieve the url".to_string(),
+                            })?;
                     info!("Connecting to {}", url);
                     Ok(Self { url })
                 } else {
-                    Err(DeviceError::Astarte(
-                        DeviceAstarteError::AstarteWrongAggregation,
-                    ))
+                    Err(DeviceError::Astarte {
+                        err: AstarteError::AstarteWrongAggregation,
+                        msg: "received wrong astarte type".to_string(),
+                    })
                 }
             }
             Err(err) => {
                 error!("Astarte error: {:?}", err);
-                Err(DeviceError::Astarte(
-                    DeviceAstarteError::AstarteHandleEvent(err),
-                ))
+                Err(DeviceError::Astarte {
+                    err: AstarteError::AstarteHandleEvent(err),
+                    msg: "failed to handle astarte event".to_string(),
+                })
             }
         }
     }
 
-    pub async fn connect<C>(&mut self, ca_cert: Option<C>) -> Result<(), DeviceError>
+    #[cfg(feature = "tls")]
+    pub async fn connect_tls<C>(&mut self, ca_cert: C) -> Result<(), DeviceError>
     where
         C: Into<Vec<u8>>,
     {
-        let ws_stream = match ca_cert {
-            #[cfg(feature = "tls")]
-            Some(ca_cert) => {
+        let ws_stream = match self.url.scheme() {
+            "wss" => {
                 let connector = tls::client_tls_config(ca_cert.into()).await; // Connector::Rustls
-
                 tls::connect(&self.url, Some(connector)).await?
             }
-            _ => {
+            scheme => {
+                return Err(DeviceError::WrongScheme(scheme.to_string()));
+            }
+        };
+
+        device_handle(ws_stream).await
+    }
+
+    pub async fn connect(&mut self) -> Result<(), DeviceError> {
+        let ws_stream = match self.url.scheme() {
+            "ws" => {
                 let (ws_stream, _) = connect_async(&self.url).await.map_err(|err| {
                     error!("Websocket error: {:?}", err);
                     DeviceError::WebSocketConnect(err)
                 })?;
                 ws_stream
+            }
+            scheme => {
+                return Err(DeviceError::WrongScheme(scheme.to_string()));
             }
         };
 
@@ -134,7 +163,7 @@ where
             });
 
             info!("Send command output to the client");
-            Ok(Message::Binary(cmd_out.as_bytes().to_vec()))
+            Ok(Message::Binary(cmd_out.as_bytes().to_vec())) // TODO: BUFFERIZE
         })
         .forward(write.sink_map_err(DeviceError::Transport))
         .await;

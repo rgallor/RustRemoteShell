@@ -51,7 +51,7 @@ where
 
 pub async fn client_tls_config(ca_cert: Vec<u8>) -> Connector {
     let mut root_certs = RootCertStore::empty();
-    let cert = Certificate(ca_cert);
+    let cert = Certificate(ca_cert); // TODO: passare una Option e se il cert non viene passato usare webpki
     root_certs
         .add(&cert)
         .expect("failed to add CA cert to the root certs");

@@ -19,7 +19,7 @@ pub enum ShellError {
         error: io::Error,
     },
     #[error("Error while formatting command output into UTF8")]
-    WrongOutConversion(#[from] FromUtf8Error), // TODO: find a way to test it
+    WrongOutConversion(#[from] FromUtf8Error),
 }
 
 #[derive(Default)]
