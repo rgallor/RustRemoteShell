@@ -28,7 +28,7 @@ use crate::tls::{self, TlsLayer};
 
 #[derive(Error, Debug)]
 pub enum HostError {
-    #[error("Error while trying to connect with server")]
+    #[error("Error while trying to connect with device")]
     WebSocketConnect(#[from] tokio_tungstenite::tungstenite::Error),
     #[error("IO error occurred while reading from stdin")]
     IORead(#[source] std::io::Error),
@@ -69,10 +69,10 @@ pub struct Host {
 impl Host {
     pub async fn bind(addr: SocketAddr) -> Result<HostBuilder<Identity>, HostError> {
         let listener = TcpListener::bind(addr).await.map_err(HostError::Bind)?;
-        let server = Self { listener };
+        let host = Self { listener };
 
         Ok(HostBuilder {
-            server,
+            host,
             builder: ServiceBuilder::new(),
         })
     }
@@ -92,13 +92,13 @@ impl Host {
 }
 
 pub struct HostBuilder<L> {
-    server: Host,
+    host: Host,
     builder: ServiceBuilder<L>,
 }
 
 impl<L> HostBuilder<L> {
     pub fn fields(self) -> (Host, ServiceBuilder<L>) {
-        (self.server, self.builder)
+        (self.host, self.builder)
     }
 }
 
@@ -112,14 +112,14 @@ impl HostBuilder<Identity> {
         let acceptor = tls::acceptor(host_cert_file, privkey_file).await?;
 
         Ok(HostBuilder {
-            server: self.server,
+            host: self.host,
             builder: self.builder.layer(TlsLayer::new(acceptor)),
         })
     }
 
     pub async fn serve(mut self) -> Result<(), HostError> {
-        let service = self.builder.layer(WebSocketLayer).service(HostService);
-        self.server.listen(service).await
+        let service = self.builder.layer(WebSocketLayer).service(HostService); // TODO: add a new layer for the protocol
+        self.host.listen(service).await
     }
 }
 
@@ -224,7 +224,7 @@ where
             if io_handler.is_exited() {
                 break Ok(());
             }
-            io_handler.send_to_server().await?;
+            io_handler.send_to_device().await?;
             io_handler.write_stdout(&rx).await?;
         }
     }

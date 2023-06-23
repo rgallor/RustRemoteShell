@@ -44,7 +44,7 @@ where
         // empty the buffer so to be able to store incoming command
         self.buf_cmd.clear();
 
-        // read a shell command from the stdin and send it to the server
+        // read a shell command from the stdin and send it to the device
         let byte_read = self
             .reader
             .read_line(&mut self.buf_cmd)
@@ -88,8 +88,8 @@ where
     }
 
     #[instrument(skip_all)]
-    pub async fn send_to_server(&mut self) -> Result<(), HostError> {
-        info!("Send command to the server");
+    pub async fn send_to_device(&mut self) -> Result<(), HostError> {
+        info!("Send command to the device");
         self.write
             .send(Message::Binary(self.buf_cmd.as_bytes().to_vec()))
             .await
