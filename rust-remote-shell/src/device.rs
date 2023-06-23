@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::{fmt::Debug, io::ErrorKind, string::FromUtf8Error};
 
-use futures::{SinkExt, StreamExt, TryStreamExt};
+use futures::{future, SinkExt, StreamExt, TryStreamExt};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::{
@@ -9,11 +9,12 @@ use tokio_tungstenite::{
     tungstenite::{error::ProtocolError, Message},
     WebSocketStream,
 };
+use tokio_util::io::ReaderStream;
 use tracing::{error, info, warn};
 use url::Url;
 
 use crate::astarte::{Error as AstarteError, HandleAstarteConnection};
-use crate::shell::CommandHandler;
+use crate::shell::{CommandHandler, ShellError};
 #[cfg(feature = "tls")]
 use crate::tls;
 
@@ -32,7 +33,9 @@ pub enum DeviceError {
     #[error("Wrong scheme, {0}")]
     WrongScheme(String),
     #[error("Error while reading from file")]
-    ReadFile(#[from] std::io::Error),
+    ReadFile(#[source] std::io::Error),
+    #[error("Error while reading from child process's stdout")]
+    ChildStdout(#[source] std::io::Error),
     #[error("Wrong item")]
     WrongItem,
     #[error("Astarte error, {}", msg)]
@@ -41,6 +44,8 @@ pub enum DeviceError {
         err: AstarteError,
         msg: String,
     },
+    #[error("Shell error")]
+    Shell(#[from] ShellError),
 }
 
 #[derive(Clone, Debug)]
@@ -158,15 +163,15 @@ where
             // define a command handler
             let cmd_handler = CommandHandler::default();
 
-            // execute the command and eventually return the error
-            let cmd_out = cmd_handler.execute(cmd).await.unwrap_or_else(|err| {
-                warn!("Shell error: {}", err);
-                format!("Shell error: {}\n", err)
-            });
+            let child_stdout = cmd_handler.execute(cmd).map_err(DeviceError::Shell)?;
 
-            info!("Send command output to the client");
-            Ok(Message::Binary(cmd_out.as_bytes().to_vec())) // TODO: BUFFERIZE
+            let stream =
+                ReaderStream::with_capacity(child_stdout, 1024).map_err(DeviceError::ChildStdout);
+
+            Ok(stream)
         })
+        .try_flatten()
+        .and_then(|bytes| future::ok(Message::Binary(bytes.to_vec())))
         .forward(write.sink_map_err(DeviceError::Transport))
         .await;
 

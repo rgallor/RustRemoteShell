@@ -20,7 +20,7 @@ use tower::layer::util::Stack;
 use tower::{layer::util::Identity, Service, ServiceBuilder};
 use tracing::{debug, error, info, instrument, trace};
 
-use crate::io_handler::IOHandler;
+use crate::io_handler::IoHandler;
 use crate::websocket::WebSocketLayer;
 
 #[cfg(feature = "tls")]
@@ -216,16 +216,16 @@ where
         rx: Arc<Mutex<UnboundedReceiver<Message>>>,
         tx_err: Sender<Result<(), HostError>>,
     ) -> Result<(), HostError> {
-        let mut iohandler = IOHandler::new(write, tx_err);
+        let mut io_handler = IoHandler::new(write, tx_err);
 
         // read from stdin and, if messages are present on the channel (rx) print them to the stdout
         loop {
-            iohandler.read_stdin().await?;
-            if iohandler.is_exited() {
+            io_handler.read_stdin().await?;
+            if io_handler.is_exited() {
                 break Ok(());
             }
-            iohandler.send_to_server().await?;
-            iohandler.write_stdout(&rx).await?;
+            io_handler.send_to_server().await?;
+            io_handler.write_stdout(&rx).await?;
         }
     }
 

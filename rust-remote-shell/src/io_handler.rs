@@ -12,7 +12,7 @@ use tracing::{debug, info, instrument, warn};
 use crate::host::HostError;
 
 #[derive(Debug)]
-pub struct IOHandler<U> {
+pub struct IoHandler<U> {
     stdout: Stdout,
     reader: BufReader<Stdin>,
     write: SplitSink<WebSocketStream<U>, Message>,
@@ -21,7 +21,7 @@ pub struct IOHandler<U> {
     exited: bool,
 }
 
-impl<U> IOHandler<U>
+impl<U> IoHandler<U>
 where
     U: AsyncRead + AsyncWrite + Unpin,
 {
