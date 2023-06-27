@@ -10,3 +10,7 @@ rust-remote-shell = { path = "../rust-remote-shell" } # cli depends on rust-remo
 clap = { version = "3.2.25", features = ["derive"] }
 color-eyre = "0.6.2"
 shellwords = "1.1.0"
+tokio = "1.28.1"
+url = "2.3.1"
+tracing = "0.1.37"
+tracing-subscriber = "0.3.17"
