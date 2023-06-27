@@ -1,3 +1,8 @@
+//! WebSocket [tower](tower::Service) service.
+//!
+//! This module contains two structs, [`WebSocketService`] and [`WebSocketLayer`], necessary to
+//! implement a WebSocket layer in the [`tower`] stack.
+
 use std::future::Future;
 use std::pin::Pin;
 
@@ -8,6 +13,9 @@ use tower::{Layer, Service};
 
 use crate::host::HostError;
 
+/// Service handling WebSocket connection.
+///
+/// This service is responsible for accepting a WebSocket connection from a device.
 #[derive(Clone)]
 pub struct WebSocketService<S> {
     service: S,
@@ -44,6 +52,7 @@ where
     }
 }
 
+/// WebSocket layer to be added in a [tower stack](tower::layer::util::Stack).
 pub struct WebSocketLayer;
 
 impl<S> Layer<S> for WebSocketLayer {

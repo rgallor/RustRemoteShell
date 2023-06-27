@@ -1,3 +1,7 @@
+//! Helper to execute shell commands.
+//!
+//! This module contains the [`CommandHandler`] struct responsible for the execution of a shell command.
+
 use std::io::{self};
 use std::string::FromUtf8Error;
 
@@ -5,30 +9,51 @@ use thiserror::Error;
 use tokio::process::{self, ChildStdout};
 use tracing::{debug, error, instrument, warn};
 
+/// Shell errors.
 #[derive(Error, Debug)]
 pub enum ShellError {
-    #[error("Empty command")]
+    /// Empty command.
+    #[error("Empty command.")]
     EmptyCommand,
-    #[error("Malformed input")]
+
+    /// Malformed input.
+    #[error("Malformed input.")]
     MalformedInput,
-    #[error("Command {cmd} does not exists")]
+
+    /// Non-existent command.
+    #[error("Not existing command.")]
     WrongCommand {
+        /// wrong command typed by the host.
         cmd: String,
+        /// Io error.
         #[source]
         error: io::Error,
     },
-    #[error("Error while formatting command output into UTF8")]
+
+    /// Error while formatting command output into UTF8.
+    #[error("Error while formatting command output into UTF8.")]
     WrongOutConversion(#[from] FromUtf8Error),
-    #[error("Error while creating child process to execute command")]
+
+    /// Error while creating child process to execute command.
+    #[error("Error while creating child process to execute command.")]
     CreateChild(#[source] io::Error),
-    #[error("Error while retrieving stdout from child process")]
+
+    /// Error while retrieving stdout from child process.
+    #[error("Error while retrieving stdout from child process.")]
     RetrieveStdout,
 }
 
+/// Struct responsible for handling commands sent by a host.
 #[derive(Default)]
 pub struct CommandHandler;
 
 impl CommandHandler {
+    /// Execute a shell command.
+    ///
+    /// This method is called by a device after having received a command from a host.
+    /// It checks if the received command command is correct and it eventually creates a [Child](tokio::process::Child) process
+    /// responsible for executing the command. The command output is retrieved from the stdout of the child process and returned
+    /// to the device.
     #[instrument(skip(self))]
     pub fn execute(&self, cmd: String) -> Result<ChildStdout, ShellError> {
         debug!("Execute command {}", cmd);
@@ -51,6 +76,7 @@ impl CommandHandler {
         Ok(stdout)
     }
 
+    // TODO: handle errors
     // fn parse() -> Result<String, ShellError> {
     //     let cmd_out = match self.inner_execute(&cmd).await {
     //         Ok(cmd_out) => {

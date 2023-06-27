@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use color_eyre::Result;
 
-use tracing::{debug, Level};
+use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
 use rust_remote_shell::device::Device;
@@ -18,7 +18,7 @@ struct Cli {
     command: Commands,
 }
 
-// these commands can be called from the CLI using lowercase Commands name
+/// Rust remote shell commands
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Host waiting for a device connection
@@ -27,17 +27,17 @@ enum Commands {
         #[clap(long, requires("host-cert-file"), requires("privkey-file"))]
         tls_enabled: bool,
         #[clap(long)]
-        host_cert_file: Option<PathBuf>, // "certs/localhost.local.der"
+        host_cert_file: Option<PathBuf>,
         #[clap(long)]
-        privkey_file: Option<PathBuf>, // "certs/localhost.local.key.der"
+        privkey_file: Option<PathBuf>,
     },
-    /// Device capable of receiving commands and sending their output
+    /// Device capable of receiving commands from an host and sending output to it
     Device {
         device_cfg_path: String,
-        #[clap(long)] // , requires("ca-cert-file")
+        #[clap(long)]
         tls_enabled: bool,
         #[clap(long)]
-        ca_cert_file: Option<PathBuf>, // "certs/CA.der"
+        ca_cert_file: Option<PathBuf>,
     },
 }
 
@@ -45,7 +45,7 @@ enum Commands {
 async fn main() -> Result<()> {
     color_eyre::install()?;
 
-    // define a subscriber for logging purposes
+    // tracing subscriber for logging
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::TRACE)
         .finish();
@@ -53,8 +53,6 @@ async fn main() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
     let cli = Cli::parse();
-
-    debug!(?cli);
 
     match cli.command {
         Commands::Host {
@@ -66,7 +64,6 @@ async fn main() -> Result<()> {
             let builder = Host::bind(addr).await?;
 
             if tls_enabled {
-                println!("TLS");
                 // retrieve certificates from the file names given in input and pass them as argument to with_tls()
                 let host_cert_file = host_cert_file.expect("host certificate must be inserted");
                 let privkey_file = privkey_file.expect("host certificate must be inserted");

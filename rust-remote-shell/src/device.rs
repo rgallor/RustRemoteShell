@@ -1,3 +1,13 @@
+//! Device implementation.
+//!
+//! This module provides a [`Device`] struct necessary for the creation of a new device and
+//! to connect through WebSocket connection with a host.
+//! Thanks to the interaction with the [astarte](crate::astarte) module,
+//! the device will first try to connect with the Astarte server.
+//!
+//! The module also provides the [`device_handle`] function, responsible for handling
+//! the communication between the device and a host.
+
 use std::path::PathBuf;
 use std::{fmt::Debug, io::ErrorKind, string::FromUtf8Error};
 
@@ -18,42 +28,77 @@ use crate::shell::{CommandHandler, ShellError};
 #[cfg(feature = "tls")]
 use crate::tls;
 
+/// Device errors.
 #[derive(Error, Debug)]
 pub enum DeviceError {
-    #[error("Error while reading the shell command from websocket")]
+    /// Error while reading the shell command from websocket.
+    #[error("Error while reading the shell command from websocket.")]
     ReadCommand,
-    #[error("Error marshaling to UTF8")]
+
+    /// Error marshaling to UTF8.
+    #[error("Error marshaling to UTF8.")]
     Utf8Error(#[from] FromUtf8Error),
-    #[error("Trasport error from Tungstenite")]
+
+    ///Trasport error from Tungstenite.
+    #[error("Trasport error from Tungstenite.")]
     Transport(#[from] tokio_tungstenite::tungstenite::Error),
-    #[error("Error while trying to connect with server")]
+
+    /// Error while trying to connect with the host.
+    #[error("Error while trying to connect with the host.")]
     WebSocketConnect(#[source] tokio_tungstenite::tungstenite::Error),
-    #[error("Close websocket connection")]
+
+    /// Close websocket connection.
+    ///
+    /// This is not an error. Instead, when a device wants to close a connection
+    /// it sends a CloseWebsocket error.
+    #[error("Close websocket connection.")]
     CloseWebsocket,
-    #[error("Wrong scheme, {0}")]
+
+    /// Wrong scheme received.
+    #[error("Wrong scheme, {0}.")]
     WrongScheme(String),
-    #[error("Error while reading from file")]
+
+    /// Error while reading from file.
+    #[error("Error while reading from file.")]
     ReadFile(#[source] std::io::Error),
-    #[error("Error while reading from child process's stdout")]
+
+    /// Error while reading stdout from child process executing the shell command.
+    #[error("Error while reading from child process's stdout.")]
     ChildStdout(#[source] std::io::Error),
-    #[error("Wrong item")]
-    WrongItem,
-    #[error("Astarte error, {}", msg)]
+
+    /// [`AstarteError`] error.
+    #[error("Astarte error, {}.", msg)]
     Astarte {
+        /// Sourece error.
         #[source]
         err: AstarteError,
+        /// Error message
         msg: String,
     },
-    #[error("Shell error")]
+
+    /// [`ShellError`] error.
+    #[error("Shell error.")]
     Shell(#[from] ShellError),
+
+    // TODO: put the tls errors in the tls.rs module
+    /// Error while loading digital certificate or private key of the host.
+    /// #[cfg(feature = "tls")]
+    #[error("Wrong item.")]
+    WrongItem,
 }
 
+/// Device struct.
+///
+/// The device will attempt to connect with Astarte. When an Astarte datastream aggregate Object
+/// arrives, the device retrieves the information and build an URL, which will subsequently use for
+/// the connection with a host, eventually adding TLS configuration.
 #[derive(Clone, Debug)]
 pub struct Device {
     url: Url,
 }
 
 impl Device {
+    /// Configure an Astarte device and wait for an Astarte event. Then retrieve an URL from the event.
     pub async fn new(device_cfg_path: &str) -> Result<Self, DeviceError> {
         let handle_astarte = HandleAstarteConnection;
 
@@ -75,8 +120,8 @@ impl Device {
 
         info!("Connection to Astarte established.");
 
-        // wait for an aggregate datastream containing IP and port to connect to
-        // TODO: loop over handle_events. If a 2nd event arrives while the device is still handling the 1st, queue it so that it can be managed later or do something else
+        // Wait for an aggregate datastream containing IP and port to connect to
+        // TODO: define 1 task to loop over handle_events. spawn a new task for each host connection. Define a channel to handle errors (handled by the main task)
         match device.handle_events().await {
             Ok(data) => {
                 if let astarte_device_sdk::Aggregation::Object(map) = data.data {
@@ -106,11 +151,12 @@ impl Device {
         }
     }
 
+    /// Connect to a host by using a TLS connection.
     #[cfg(feature = "tls")]
     pub async fn connect_tls(&mut self, ca_cert_file: Option<PathBuf>) -> Result<(), DeviceError> {
         let ws_stream = match self.url.scheme() {
             "wss" => {
-                let connector = tls::client_tls_config(ca_cert_file).await?; // Connector::Rustls
+                let connector = tls::device_tls_config(ca_cert_file).await?; // Connector::Rustls
                 tls::connect(&self.url, Some(connector)).await?
             }
             scheme => {
@@ -121,6 +167,7 @@ impl Device {
         device_handle(ws_stream).await
     }
 
+    /// Connect to a host by using a plain TCP connection
     pub async fn connect(&mut self) -> Result<(), DeviceError> {
         let ws_stream = match self.url.scheme() {
             "ws" => {
@@ -139,7 +186,9 @@ impl Device {
     }
 }
 
-// the device listen for commands, execute them and send the output to the host
+/// Function responsible for handling the communication between the device and a host.
+///
+/// The device listens for commands, executes them and sends the output to the host.
 pub async fn device_handle<U>(stream: WebSocketStream<U>) -> Result<(), DeviceError>
 where
     U: AsyncRead + AsyncWrite + Unpin,
@@ -163,6 +212,8 @@ where
             // define a command handler
             let cmd_handler = CommandHandler::default();
 
+            // TODO: Non ritornare ChildStdout. Piuttosto salvare ChildStdout come campo interno dello ShellHandler e poi definire una funzione stdout() che ritorna ChildStdout, da usare nella funzione ReaderStream::with_capacity.
+            // TODO: handle errors (look at shell.rs)
             let child_stdout = cmd_handler.execute(cmd).map_err(DeviceError::Shell)?;
 
             let stream =
@@ -177,10 +228,12 @@ where
 
     match res {
         Ok(()) => Ok(()),
-        Err(DeviceError::CloseWebsocket)
-        | Err(DeviceError::Transport(tokio_tungstenite::tungstenite::Error::Protocol(
-            ProtocolError::ResetWithoutClosingHandshake,
-        ))) => {
+        Err(
+            DeviceError::CloseWebsocket
+            | DeviceError::Transport(tokio_tungstenite::tungstenite::Error::Protocol(
+                ProtocolError::ResetWithoutClosingHandshake,
+            )),
+        ) => {
             warn!("Websocket connection closed");
             Ok(())
         }

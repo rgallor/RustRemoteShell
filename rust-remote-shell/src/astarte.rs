@@ -1,3 +1,7 @@
+//! Implement the interaction with the [Astarte rust SDK](astarte_device_sdk).
+//!
+//! Module responsible for handling a connection between a Device and Astarte.
+
 use std::{collections::HashMap, fmt::Display, net::AddrParseError, num::TryFromIntError};
 
 use astarte_device_sdk::{
@@ -10,34 +14,61 @@ use thiserror::Error;
 use tracing::debug;
 use url::Url;
 
+/// Astarte errors.
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("Error while loading the Astarte Interfaces")]
+    /// Error while loading the Astarte Interfaces.
+    #[error("Error while loading the Astarte Interfaces.")]
     AstarteInterface(#[from] AstarteOptionsError),
-    #[error("Error while creating an Astarte device")]
+
+    /// Error while creating an Astarte device.
+    #[error("Error while creating an Astarte device.")]
     AstarteCreateDevice(#[from] AstarteError),
-    #[error("Error while handling Astarte events")]
+
+    /// Error while handling an Astarte event.
+    #[error("Error while handling an Astarte event.")]
     AstarteHandleEvent(#[source] AstarteError),
-    #[error("Received Individual aggregation data type")]
+
+    /// Received a wrong Astarte type.
+    #[error("Received Individual aggregation data type.")]
     AstarteWrongAggregation,
-    #[error("Received wrong astarte type")]
+
+    /// Error occurring when different fields from those of the mapping are received.
+    #[error(
+        "Error occurring due to the different fields from those of the mapping have been received."
+    )]
     AstarteWrongType,
-    #[error("Error while reading a file")]
+
+    /// Error while reading a file.
+    #[error("Error while reading a file.")]
     ReadFile(#[from] tokio::io::Error),
-    #[error("Error while serializing/deserializing with serde")]
+
+    /// Error while serializing/deserializing with serde.
+    #[error("Error while serializing/deserializing with serde.")]
     Serde,
-    #[error("Error while parsing url")]
+
+    /// Error while parsing an url.
+    #[error("Error while parsing url.")]
     Parse(#[from] url::ParseError),
-    #[error("Wrong scheme, {0}")]
+
+    /// Received a wrong scheme.
+    #[error("Wrong scheme, {0}.")]
     ParseScheme(String),
-    #[error("Error while parsing the ip address")]
+
+    /// Received a malformed IP address.
+    #[error("Error while parsing the ip address.")]
     ParseAddr(#[from] AddrParseError),
-    #[error("Error while parsing the port number")]
+
+    /// Received a malformed port number.
+    #[error("Error while parsing the port number.")]
     ParsePort(#[from] TryFromIntError),
-    #[error("Missing url information")]
+
+    /// Missing url information.
+    #[error("Missing url information.")]
     MissingUrlInfo(String),
 }
 
+/// Struct containing the configuration for an Astarte device.
 #[derive(Serialize, Deserialize)]
 pub struct DeviceConfig {
     realm: String,
@@ -73,6 +104,7 @@ impl TryFrom<&str> for Scheme {
     }
 }
 
+/// Struct representing the fields of an aggregated object the Astarte server can send to the device.
 #[derive(Debug, Clone)]
 pub struct DataAggObject {
     scheme: Scheme,
@@ -101,7 +133,7 @@ impl TryFrom<DataAggObject> for Url {
     fn try_from(value: DataAggObject) -> Result<Self, Self::Error> {
         let ip = match value.host {
             url::Host::Domain(domain) => domain,
-            // the IP 127.0.0.1 cannot be used due to a low MSRV, therefore the IP is converted to a domain name
+            // Note: the IP 127.0.0.1 cannot be used due to a low MSRV, therefore the IP is converted to a domain name
             url::Host::Ipv4(ipv4) if std::net::Ipv4Addr::LOCALHOST == ipv4 => {
                 "localhost.local".to_string()
             }
@@ -111,9 +143,11 @@ impl TryFrom<DataAggObject> for Url {
     }
 }
 
+/// Struct responsible for handling the connection between a device and Astarte.
 pub struct HandleAstarteConnection;
 
 impl HandleAstarteConnection {
+    /// Read the device configuration file and store the retrieved information.
     pub async fn read_device_config(&self, device_cfg_path: &str) -> Result<DeviceConfig, Error> {
         let file = tokio::fs::read(device_cfg_path)
             .await
@@ -125,6 +159,7 @@ impl HandleAstarteConnection {
         Ok(cfg)
     }
 
+    /// Use the device configuration to create a new instance of an Astarte device and connect it to Astarte.
     pub async fn create_astarte_device(
         &self,
         cfg: &DeviceConfig,
@@ -146,6 +181,7 @@ impl HandleAstarteConnection {
         Ok(device)
     }
 
+    /// Parse an HashMap containig pairs (Endpoint, [`AstarteType`]) into an URL.
     pub fn retrieve_url(&self, map: HashMap<String, AstarteType>) -> Result<Url, Error> {
         let scheme = map
             .get("scheme")

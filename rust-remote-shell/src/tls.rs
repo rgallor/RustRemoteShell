@@ -1,3 +1,13 @@
+//! TLS functionality.
+//!
+//! This module provides the necessary functionalities to add a TLS layer on top of the communication between a device and a host.
+//! The [`host_tls_config`] and [`acceptor`] functions allow to set the TLS configuration for a
+//! host and to provide the necessary TLS connector, necessary to establish a TLS connection with a device.
+//! The [`device_tls_config`] and [`connect`] functions allow to set the TLS configuration for a
+//! device and to establish a TLS connection with a host.
+//!
+//! The module also contains the [`TlsService`] and [`TlsLayer`] struct, necessary to implement a Tls layer in the [`tower`] stack.
+
 use futures::Future;
 
 use rustls_pemfile::{read_all, read_one, Item};
@@ -22,9 +32,13 @@ use url::Url;
 
 use crate::device::DeviceError;
 use crate::host::{HostBuilder, HostError};
+use crate::{host::HostService, websocket::WebSocketLayer};
 
+// TODO: add Error (TlsError) + add errorsa from host.rs and device.rs
+
+/// Given the host certificate and private key, return the TLS configuration for the host.
 #[instrument(skip_all)]
-pub async fn server_tls_config<C, P>(
+pub async fn host_tls_config<C, P>(
     cert: C,
     privkey: P,
 ) -> Result<tokio_rustls::rustls::ServerConfig, HostError>
@@ -45,6 +59,7 @@ where
     Ok(config)
 }
 
+/// Given the host certificate and private key files, compute a TLS connection acceptor.
 pub async fn acceptor(
     host_cert_file: PathBuf,
     privkey_file: PathBuf,
@@ -67,7 +82,7 @@ pub async fn acceptor(
         _ => return Err(HostError::WrongItem),
     };
 
-    let acceptor = TlsAcceptor::from(Arc::new(server_tls_config(cert, privkey).await?));
+    let acceptor = TlsAcceptor::from(Arc::new(host_tls_config(cert, privkey).await?));
     Ok(acceptor)
 }
 
@@ -77,7 +92,8 @@ fn retrieve_item(file: &Path) -> Result<Option<Item>, std::io::Error> {
         .and_then(|mut reader| read_one(&mut reader))
 }
 
-pub async fn client_tls_config(ca_cert_file: Option<PathBuf>) -> Result<Connector, DeviceError> {
+/// Given the CA certificate, compute the device TLS configuration and return a Device connector.
+pub async fn device_tls_config(ca_cert_file: Option<PathBuf>) -> Result<Connector, DeviceError> {
     let mut root_certs = RootCertStore::empty();
 
     if let Some(ca_cert_file) = ca_cert_file {
@@ -114,6 +130,7 @@ pub async fn client_tls_config(ca_cert_file: Option<PathBuf>) -> Result<Connecto
     Ok(Connector::Rustls(Arc::new(config)))
 }
 
+/// Function used by a device to connect via TLS to a host. It returns a WebSocket connection.
 pub async fn connect(
     url: &Url,
     connector: Option<Connector>,
@@ -128,6 +145,10 @@ pub async fn connect(
     Ok(ws_stream)
 }
 
+/// TLS [`tower`] service.
+///
+/// This service add a [`TlsLayer`] on top of a tower stack.
+///  It is responsible for the handling of a TLS connection.
 #[derive(Clone)]
 pub struct TlsService<S> {
     service: S,
@@ -164,11 +185,13 @@ where
     }
 }
 
+/// TLS layer to be added in a [tower stack](tower::layer::util::Stack).
 pub struct TlsLayer {
     acceptor: TlsAcceptor,
 }
 
 impl TlsLayer {
+    /// Constructor for a [`TlsLayer`].
     pub fn new(acceptor: TlsAcceptor) -> Self {
         Self { acceptor }
     }
@@ -186,10 +209,8 @@ impl<S> Layer<S> for TlsLayer {
 }
 
 impl HostBuilder<Stack<TlsLayer, Identity>> {
-    #[cfg(feature = "tls")]
+    /// Add the TlsLayer on top of the tower stack and listen to a connection from a device.
     pub async fn serve(self) -> Result<(), HostError> {
-        use crate::{host::HostService, websocket::WebSocketLayer};
-
         let (mut server, builder) = self.fields();
         let service = builder.layer(WebSocketLayer).service(HostService);
 
