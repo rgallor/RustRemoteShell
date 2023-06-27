@@ -11,7 +11,7 @@ use astarte_device_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, instrument};
 use url::Url;
 
 /// Astarte errors.
@@ -186,6 +186,7 @@ impl HandleAstarteConnection {
     }
 
     /// Parse an `HashMap` containig pairs (Endpoint, [`AstarteType`]) into an URL.
+    #[instrument(skip_all)]
     pub fn retrieve_url(&self, map: &HashMap<String, AstarteType>) -> Result<Url, Error> {
         let scheme = map
             .get("scheme")

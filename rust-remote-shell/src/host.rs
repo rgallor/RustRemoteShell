@@ -110,6 +110,7 @@ impl Host {
     /// Wait for a new connection from a device and handle it.
     ///
     /// service is an handler for the single connection.
+    #[instrument(skip_all)]
     pub async fn listen<S>(&mut self, mut service: S) -> Result<(), HostError>
     where
         S: Service<TcpStream, Error = HostError> + Clone + 'static,

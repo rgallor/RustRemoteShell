@@ -20,7 +20,7 @@ use tokio_tungstenite::{
     WebSocketStream,
 };
 use tokio_util::io::ReaderStream;
-use tracing::{error, info, warn};
+use tracing::{error, info, instrument, warn};
 use url::Url;
 
 use crate::astarte::{Error as AstarteError, HandleAstarteConnection};
@@ -98,6 +98,7 @@ pub struct Device {
 
 impl Device {
     /// Configure an Astarte device and wait for an Astarte event. Then retrieve an URL from the event.
+    #[instrument(skip_all)]
     pub async fn new(device_cfg_path: &str) -> Result<Self, DeviceError> {
         let handle_astarte = HandleAstarteConnection;
 
@@ -167,6 +168,7 @@ impl Device {
     }
 
     /// Connect to a host by using a plain TCP connection
+    #[instrument(skip_all)]
     pub async fn connect(&mut self) -> Result<(), DeviceError> {
         let ws_stream = match self.url.scheme() {
             "ws" => {
@@ -188,6 +190,7 @@ impl Device {
 /// Function responsible for handling the communication between the device and a host.
 ///
 /// The device listens for commands, executes them and sends the output to the host.
+#[instrument(skip_all)]
 pub async fn device_handle<U>(stream: WebSocketStream<U>) -> Result<(), DeviceError>
 where
     U: AsyncRead + AsyncWrite + Unpin,

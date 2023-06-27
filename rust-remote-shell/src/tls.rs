@@ -110,6 +110,7 @@ fn retrieve_item(file: &Path) -> Result<Option<Item>, std::io::Error> {
 }
 
 /// Given the CA certificate, compute the device TLS configuration and return a Device connector.
+#[instrument(skip_all)]
 pub fn device_tls_config(ca_cert_file: Option<PathBuf>) -> Result<Connector, DeviceError> {
     let mut root_certs = RootCertStore::empty();
 
@@ -148,6 +149,7 @@ pub fn device_tls_config(ca_cert_file: Option<PathBuf>) -> Result<Connector, Dev
 }
 
 /// Function used by a device to connect via TLS to a host. It returns a WebSocket connection.
+#[instrument(skip_all)]
 pub async fn connect(
     url: &Url,
     connector: Option<Connector>,
