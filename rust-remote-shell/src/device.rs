@@ -26,7 +26,7 @@ use url::Url;
 use crate::astarte::{Error as AstarteError, HandleAstarteConnection};
 use crate::shell::{CommandHandler, ShellError};
 #[cfg(feature = "tls")]
-use crate::tls;
+use crate::tls::{self, Error as TlsError};
 
 /// Device errors.
 #[derive(Error, Debug)]
@@ -80,11 +80,10 @@ pub enum DeviceError {
     #[error("Shell error.")]
     Shell(#[from] ShellError),
 
-    // TODO: put the tls errors in the tls.rs module
-    /// Error while loading digital certificate or private key of the host.
-    /// #[cfg(feature = "tls")]
+    /// TLS error
+    #[cfg(feature = "tls")]
     #[error("Wrong item.")]
-    WrongItem,
+    Tls(#[from] TlsError),
 }
 
 /// Device struct.

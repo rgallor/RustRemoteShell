@@ -16,6 +16,7 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::{
@@ -34,7 +35,23 @@ use crate::device::DeviceError;
 use crate::host::{HostBuilder, HostError};
 use crate::{host::HostService, websocket::WebSocketLayer};
 
-// TODO: add Error (TlsError) + add errorsa from host.rs and device.rs
+/// TLS errora
+#[derive(Error, Debug)]
+pub enum Error {
+    /// Error while loading digital certificate or private key.
+    #[error("Wrong item.")]
+    WrongItem,
+
+    /// Error while establishing a TLS connection.
+    #[cfg(feature = "tls")]
+    #[error("Error while establishing a TLS connection.")]
+    RustTls(#[from] tokio_rustls::rustls::Error),
+
+    /// Error while accepting a TLS connection.
+    #[cfg(feature = "tls")]
+    #[error("Error while accepting a TLS connection.")]
+    AcceptTls(#[source] std::io::Error),
+}
 
 /// Given the host certificate and private key, return the TLS configuration for the host.
 #[instrument(skip_all)]
@@ -52,7 +69,7 @@ where
         .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(certs, PrivateKey(privkey.into()))
-        .map_err(HostError::RustTls)?;
+        .map_err(|err| HostError::Tls(Error::RustTls(err)))?;
 
     debug!("config created: {:?}", config);
 
@@ -70,7 +87,7 @@ pub async fn acceptor(
     })?;
     let cert = match cert_item {
         Some(Item::X509Certificate(ca_cert)) => ca_cert,
-        _ => return Err(HostError::WrongItem),
+        _ => return Err(HostError::Tls(Error::WrongItem)),
     };
 
     let privkey_item = retrieve_item(&privkey_file).map_err(|err| HostError::ReadFile {
@@ -79,7 +96,7 @@ pub async fn acceptor(
     })?;
     let privkey = match privkey_item {
         Some(Item::PKCS8Key(privkey)) => privkey,
-        _ => return Err(HostError::WrongItem),
+        _ => return Err(HostError::Tls(Error::WrongItem)),
     };
 
     let acceptor = TlsAcceptor::from(Arc::new(host_tls_config(cert, privkey).await?));
@@ -109,7 +126,7 @@ pub async fn device_tls_config(ca_cert_file: Option<PathBuf>) -> Result<Connecto
                         .add(&cert)
                         .expect("failed to add CA cert to the root certs");
                 }
-                _ => return Err(DeviceError::WrongItem),
+                _ => return Err(DeviceError::Tls(Error::WrongItem)),
             }
         }
     };
@@ -179,7 +196,10 @@ where
         // take the service that was ready
         let mut inner = std::mem::replace(&mut self.service, clone);
         Box::pin(async move {
-            let stream = acceptor.accept(req).await.map_err(HostError::AcceptTls)?;
+            let stream = acceptor
+                .accept(req)
+                .await
+                .map_err(|err| HostError::Tls(Error::AcceptTls(err)))?;
             inner.call(stream).await.map_err(HostError::from)
         })
     }

@@ -30,7 +30,7 @@ use crate::io_handler::IoHandler;
 use crate::websocket::WebSocketLayer;
 
 #[cfg(feature = "tls")]
-use crate::tls::{self, TlsLayer};
+use crate::tls::{self, Error as TlsError, TlsLayer};
 
 /// Host error.
 #[derive(Error, Debug)]
@@ -39,7 +39,6 @@ pub enum HostError {
     #[error("Error while trying to connect with a device.")]
     WebSocketConnect(#[from] tokio_tungstenite::tungstenite::Error),
 
-    // TODO: create a new enum for IO errors
     /// Error while reading from stdin.
     #[error("IO error occurred while reading from stdin.")]
     IORead(#[source] std::io::Error),
@@ -82,21 +81,10 @@ pub enum HostError {
     #[error("Sender channel was dropped before sending message.")]
     ChannelDropped,
 
-    // TODO: put the tls errors in the tls.rs module
-    /// Error while loading digital certificate or private key of the host.
+    /// TLS error
     #[cfg(feature = "tls")]
     #[error("Wrong item.")]
-    WrongItem,
-
-    /// Error while establishing a TLS connection.
-    #[cfg(feature = "tls")]
-    #[error("Error while establishing a TLS connection.")]
-    RustTls(#[from] tokio_rustls::rustls::Error),
-
-    /// Error while accepting a TLS connection.
-    #[cfg(feature = "tls")]
-    #[error("Error while accepting a TLS connection.")]
-    AcceptTls(#[source] std::io::Error),
+    Tls(#[from] TlsError),
 }
 
 /// Host struct.
