@@ -35,6 +35,7 @@ where
     U: AsyncRead + AsyncWrite + Unpin,
 {
     /// Define a new [`IoHandler`].
+    #[must_use]
     pub fn new(
         write: SplitSink<WebSocketStream<U>, Message>,
         tx_err: Sender<Result<(), HostError>>,
@@ -98,6 +99,7 @@ where
     /// Check if the host exited.
     ///
     /// The host exits when EOF or `exit` is received from stdin.
+    #[must_use]
     pub fn is_exited(&self) -> bool {
         self.exited
     }

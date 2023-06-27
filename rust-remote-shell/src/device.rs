@@ -126,7 +126,7 @@ impl Device {
                 if let astarte_device_sdk::Aggregation::Object(map) = data.data {
                     let url =
                         handle_astarte
-                            .retrieve_url(map)
+                            .retrieve_url(&map)
                             .map_err(|err| DeviceError::Astarte {
                                 err,
                                 msg: "failed to retrieve the url".to_string(),
@@ -155,7 +155,7 @@ impl Device {
     pub async fn connect_tls(&mut self, ca_cert_file: Option<PathBuf>) -> Result<(), DeviceError> {
         let ws_stream = match self.url.scheme() {
             "wss" => {
-                let connector = tls::device_tls_config(ca_cert_file).await?; // Connector::Rustls
+                let connector = tls::device_tls_config(ca_cert_file)?; // Connector::Rustls
                 tls::connect(&self.url, Some(connector)).await?
             }
             scheme => {

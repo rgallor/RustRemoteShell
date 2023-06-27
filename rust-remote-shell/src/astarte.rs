@@ -66,6 +66,10 @@ pub enum Error {
     /// Missing url information.
     #[error("Missing url information.")]
     MissingUrlInfo(String),
+
+    /// Error marshaling to UTF8.
+    #[error("Error marshaling to UTF8.")]
+    Utf8Error(#[from] std::str::Utf8Error),
 }
 
 /// Struct containing the configuration for an Astarte device.
@@ -152,7 +156,7 @@ impl HandleAstarteConnection {
         let file = tokio::fs::read(device_cfg_path)
             .await
             .map_err(Error::ReadFile)?;
-        let file = std::str::from_utf8(&file).unwrap();
+        let file = std::str::from_utf8(&file).map_err(Error::Utf8Error)?;
 
         let cfg: DeviceConfig = serde_json::from_str(file).map_err(|_| Error::Serde)?;
 
@@ -181,8 +185,8 @@ impl HandleAstarteConnection {
         Ok(device)
     }
 
-    /// Parse an HashMap containig pairs (Endpoint, [`AstarteType`]) into an URL.
-    pub fn retrieve_url(&self, map: HashMap<String, AstarteType>) -> Result<Url, Error> {
+    /// Parse an `HashMap` containig pairs (Endpoint, [`AstarteType`]) into an URL.
+    pub fn retrieve_url(&self, map: &HashMap<String, AstarteType>) -> Result<Url, Error> {
         let scheme = map
             .get("scheme")
             .ok_or_else(|| Error::MissingUrlInfo("Missing scheme".to_string()))?;

@@ -110,7 +110,7 @@ fn retrieve_item(file: &Path) -> Result<Option<Item>, std::io::Error> {
 }
 
 /// Given the CA certificate, compute the device TLS configuration and return a Device connector.
-pub async fn device_tls_config(ca_cert_file: Option<PathBuf>) -> Result<Connector, DeviceError> {
+pub fn device_tls_config(ca_cert_file: Option<PathBuf>) -> Result<Connector, DeviceError> {
     let mut root_certs = RootCertStore::empty();
 
     if let Some(ca_cert_file) = ca_cert_file {
@@ -212,6 +212,7 @@ pub struct TlsLayer {
 
 impl TlsLayer {
     /// Constructor for a [`TlsLayer`].
+    #[must_use]
     pub fn new(acceptor: TlsAcceptor) -> Self {
         Self { acceptor }
     }
@@ -229,7 +230,7 @@ impl<S> Layer<S> for TlsLayer {
 }
 
 impl HostBuilder<Stack<TlsLayer, Identity>> {
-    /// Add the TlsLayer on top of the tower stack and listen to a connection from a device.
+    /// Add the [`TlsLayer`] on top of the tower stack and listen to a connection from a device.
     pub async fn serve(self) -> Result<(), HostError> {
         let (mut server, builder) = self.fields();
         let service = builder.layer(WebSocketLayer).service(HostService);
