@@ -10,3 +10,10 @@ target/
 *.pdb
 
 .pre-commit-config.yaml
+
+/certs/
+/certsMacOS/
+
+.DS_Store
+
+.vscode/
