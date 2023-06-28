@@ -1,4 +1,5 @@
-#![doc = include_str!("../../README.md")] // TODO: Add crate information in the README
+#![warn(missing_docs)]
+#![doc = include_str!("../README.md")] // TODO: Add crate information in the README
 
 pub mod astarte;
 pub mod device;
