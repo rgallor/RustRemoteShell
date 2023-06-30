@@ -8,25 +8,23 @@ use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 use futures::stream::SplitSink;
-use futures::{Future, StreamExt, TryStreamExt};
+use futures::{Future, SinkExt, StreamExt};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::error::SendError;
-use tokio::sync::mpsc::{Sender, UnboundedReceiver};
-use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
-use tokio_tungstenite::tungstenite::error::ProtocolError;
+
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use tower::layer::util::Stack;
 use tower::{layer::util::Identity, Service, ServiceBuilder};
-use tracing::{debug, error, info, instrument, trace};
+use tracing::{error, info, instrument};
 
-use crate::io_handler::IoHandler;
+use crate::protocol::{DeviceMsg, DeviceMsgStream, ProtocolLayer};
 use crate::websocket::WebSocketLayer;
 
 #[cfg(feature = "tls")]
@@ -165,7 +163,12 @@ impl HostBuilder<Identity> {
 
     /// Call the host listen function after having added the necessary layers
     pub async fn serve(mut self) -> Result<(), HostError> {
-        let service = self.builder.layer(WebSocketLayer).service(HostService); // TODO: add a new layer for the protocol
+        let service = self
+            .builder
+            .layer(WebSocketLayer)
+            .layer(ProtocolLayer) // TODO: PROTOCOL (add also in the TLS serve() method)
+            .service(HostService);
+
         self.host.listen(service).await
     }
 }
@@ -174,7 +177,7 @@ impl HostBuilder<Identity> {
 #[derive(Clone, Debug)]
 pub struct HostService;
 
-impl<U> Service<WebSocketStream<U>> for HostService
+impl<U> Service<HandleConnection<U>> for HostService
 where
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -189,9 +192,8 @@ where
         std::task::Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, req: WebSocketStream<U>) -> Self::Future {
-        let handler = HandleConnection::new(req);
-        Box::pin(handler.handle_connection())
+    fn call(&mut self, req: HandleConnection<U>) -> Self::Future {
+        Box::pin(req.handle_connection())
     }
 }
 
@@ -199,127 +201,163 @@ where
 ///
 /// Implement the necessary methods to handle a single connection with a device.
 /// The host sends commands, wait for device's answer and display it.
-struct HandleConnection<U> {
-    ws_stream: WebSocketStream<U>,
+pub struct HandleConnection<U> {
+    ws_stream: SplitSink<WebSocketStream<U>, Message>, // From<Protocol> for Message
+    msg_stream: DeviceMsgStream,
 }
 
 impl<U> HandleConnection<U>
 where
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    fn new(ws_stream: WebSocketStream<U>) -> Self {
-        Self { ws_stream }
+    /// Create a new handler for a connection.
+    pub fn new(
+        msg_stream: DeviceMsgStream,
+        ws_stream: SplitSink<WebSocketStream<U>, Message>,
+    ) -> Self {
+        Self {
+            ws_stream,
+            msg_stream,
+        }
     }
 
+    /// Connection handler
     #[instrument(skip_all)]
-    pub async fn handle_connection(self) -> Result<(), HostError> {
-        let (write, read) = self.ws_stream.split();
+    pub async fn handle_connection(mut self) -> Result<(), HostError> {
+        // TODO: read from stdin
+        let mut buf = String::new();
+        let mut reader = BufReader::new(tokio::io::stdin());
 
-        // Define a channel used to communicate command output from a task responsible for receiving commands output from a device to a task responsible
-        // of printing them to the stdout.
-        let (tx_cmd_out, rx_cmd_out) = tokio::sync::mpsc::unbounded_channel::<Message>();
-        let rx_cmd_out = Arc::new(Mutex::new(rx_cmd_out));
-        let rx_cmd_out_clone = Arc::clone(&rx_cmd_out);
+        let _byte_read = reader
+            .read_line(&mut buf)
+            .await
+            .map_err(HostError::IORead)?;
 
-        // Define a channel used to communicate errors between tasks.
-        let (tx_err, mut rx_err) = tokio::sync::mpsc::channel::<Result<(), HostError>>(1);
+        self.ws_stream
+            .send(Message::Binary(buf.as_bytes().to_vec()))
+            .await
+            .map_err(HostError::TungsteniteReadData)?;
 
-        // Define a task to handle stdin and stdout.
-        let handle_std_in_out =
-            tokio::spawn(Self::read_write(write, rx_cmd_out_clone, tx_err.clone()));
-
-        // Define a task to handle the recepotion of commands output.
-        let handle_read = tokio::spawn(async move {
-            let res = read
-                .map_err(HostError::TungsteniteReadData)
-                .try_for_each(|cmd_out| async {
-                    tx_cmd_out.send(cmd_out).map_err(HostError::ChannelMsg)
-                })
-                .await;
-
-            if let Err(err) = res {
-                tx_err.send(Err(err)).await.expect("channel error");
-            }
-
-            Ok(())
-        });
-
-        let mut handles = [handle_std_in_out, handle_read];
-
-        // handle possible errors
-        let res = rx_err.recv().await.ok_or(HostError::ChannelDropped)?;
-        match res {
-            // Close the websocket connection when the device get disconnected.
-            Ok(())
-            | Err(HostError::TungsteniteReadData(
-                tokio_tungstenite::tungstenite::Error::Protocol(
-                    ProtocolError::ResetWithoutClosingHandshake,
-                ),
-            )) => {
-                info!("Closing websocket connection due to device interruption");
-                Self::close(&mut handles, rx_cmd_out).await
-            }
-            // Report an error after closing the connection if something else happens.
-            Err(err) => {
-                error!("Fatal error: {:?}", err);
-                Self::close(&mut handles, rx_cmd_out).await?;
-                Err(err)
+        while let Some(msg) = self.msg_stream.next().await {
+            let msg = msg?;
+            match msg {
+                DeviceMsg::Eof => {
+                    info!("EOF received");
+                    return Ok(());
+                }
+                _ => unimplemented!(), // TODO: implement receipt of a message output
             }
         }
+
+        Ok(())
+
+        // let (write, read) = self.msg_stream.split();
+
+        // // Define a channel used to communicate command output from a task responsible for receiving commands output from a device to a task responsible
+        // // of printing them to the stdout.
+        // let (tx_cmd_out, rx_cmd_out) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        // let rx_cmd_out = Arc::new(Mutex::new(rx_cmd_out));
+        // let rx_cmd_out_clone = Arc::clone(&rx_cmd_out);
+
+        // // Define a channel used to communicate errors between tasks.
+        // let (tx_err, mut rx_err) = tokio::sync::mpsc::channel::<Result<(), HostError>>(1);
+
+        // // Define a task to handle stdin and stdout.
+        // let handle_std_in_out =
+        //     tokio::spawn(Self::read_write(write, rx_cmd_out_clone, tx_err.clone()));
+
+        // // Define a task to handle the reception of commands output.
+        // let handle_read = tokio::spawn(async move {
+        //     let res = read
+        //         .map_err(HostError::TungsteniteReadData)
+        //         .try_for_each(|cmd_out| async {
+        //             tx_cmd_out.send(cmd_out).map_err(HostError::ChannelMsg)
+        //         })
+        //         .await;
+
+        //     if let Err(err) = res {
+        //         tx_err.send(Err(err)).await.expect("channel error");
+        //     }
+
+        //     Ok(())
+        // });
+
+        // let mut handles = [handle_std_in_out, handle_read];
+
+        // // handle possible errors
+        // let res = rx_err.recv().await.ok_or(HostError::ChannelDropped)?;
+        // match res {
+        //     // Close the websocket connection when the device get disconnected.
+        //     Ok(())
+        //     | Err(HostError::TungsteniteReadData(
+        //         tokio_tungstenite::tungstenite::Error::Protocol(
+        //             ProtocolError::ResetWithoutClosingHandshake,
+        //         ),
+        //     )) => {
+        //         info!("Closing websocket connection due to device interruption");
+        //         Self::close(&mut handles, rx_cmd_out).await
+        //     }
+        //     // Report an error after closing the connection if something else happens.
+        //     Err(err) => {
+        //         error!("Fatal error: {:?}", err);
+        //         Self::close(&mut handles, rx_cmd_out).await?;
+        //         Err(err)
+        //     }
+        // }
     }
 
     // Function responsible for reading from stdin and printing eventual messages output into the stdout
-    async fn read_write(
-        write: SplitSink<WebSocketStream<U>, Message>,
-        rx: Arc<Mutex<UnboundedReceiver<Message>>>,
-        tx_err: Sender<Result<(), HostError>>,
-    ) -> Result<(), HostError> {
-        let mut io_handler = IoHandler::new(write, tx_err);
+    // async fn read_write(
+    //     write: SplitSink<WebSocketStream<U>, Message>,
+    //     rx: Arc<Mutex<UnboundedReceiver<Message>>>,
+    //     tx_err: Sender<Result<(), HostError>>,
+    // ) -> Result<(), HostError> {
+    //     let mut io_handler = IoHandler::new(write, tx_err);
 
-        loop {
-            io_handler.read_stdin().await?;
-            if io_handler.is_exited() {
-                break Ok(());
-            }
-            io_handler.send_to_device().await?;
-            io_handler.write_stdout(&rx).await?;
-        }
-    }
+    //     loop {
+    //         io_handler.read_stdin().await?;
+    //         if io_handler.is_exited() {
+    //             break Ok(());
+    //         }
+    //         io_handler.send_to_device().await?;
+    //         io_handler.write_stdout(&rx).await?;
+    //     }
+    // }
 
-    // Abort the current active tasks and, if available, print to the stout the buffered commands output.
-    #[instrument(skip_all)]
-    async fn close(
-        handles: &mut [JoinHandle<Result<(), HostError>>],
-        rx_cmd_out: Arc<Mutex<UnboundedReceiver<Message>>>,
-    ) -> Result<(), HostError> {
-        for h in handles.iter() {
-            h.abort();
-        }
+    // // Abort the current active tasks and, if available, print to the stout the buffered commands output.
+    // #[instrument(skip_all)]
+    // async fn close(
+    //     handles: &mut [JoinHandle<Result<(), HostError>>],
+    //     rx_cmd_out: Arc<Mutex<UnboundedReceiver<Message>>>,
+    // ) -> Result<(), HostError> {
+    //     for h in handles.iter() {
+    //         h.abort();
+    //     }
 
-        for h in handles {
-            match h.await {
-                Err(err) if !err.is_cancelled() => {
-                    error!("Join failed: {}", err);
-                }
-                Err(_) => {
-                    trace!("Task cancelled");
-                }
-                Ok(res) => {
-                    debug!("Task joined with: {:?}", res);
-                }
-            }
-        }
+    //     for h in handles {
+    //         match h.await {
+    //             Err(err) if !err.is_cancelled() => {
+    //                 error!("Join failed: {}", err);
+    //             }
+    //             Err(_) => {
+    //                 trace!("Task cancelled");
+    //             }
+    //             Ok(res) => {
+    //                 debug!("Task joined with: {:?}", res);
+    //             }
+    //         }
+    //     }
 
-        let mut channel = rx_cmd_out.lock().await;
-        let mut stdout = tokio::io::stdout();
-        while let Ok(cmd_out) = channel.try_recv() {
-            let data = cmd_out.into_data();
-            stdout.write(&data).await.map_err(HostError::IOWrite)?;
-            stdout.flush().await.map_err(HostError::IOWrite)?;
-        }
+    //     let mut channel = rx_cmd_out.lock().await;
+    //     let mut stdout = tokio::io::stdout();
+    //     while let Ok(cmd_out) = channel.try_recv() {
+    //         let data = cmd_out.into_data();
+    //         stdout.write(&data).await.map_err(HostError::IOWrite)?;
+    //         stdout.flush().await.map_err(HostError::IOWrite)?;
+    //     }
 
-        info!("Client terminated");
+    //     info!("Client terminated");
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 }

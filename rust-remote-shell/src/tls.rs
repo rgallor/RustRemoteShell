@@ -33,6 +33,7 @@ use url::Url;
 
 use crate::device::DeviceError;
 use crate::host::{HostBuilder, HostError};
+use crate::protocol::ProtocolLayer;
 use crate::{host::HostService, websocket::WebSocketLayer};
 
 /// TLS errora
@@ -235,7 +236,10 @@ impl HostBuilder<Stack<TlsLayer, Identity>> {
     /// Add the [`TlsLayer`] on top of the tower stack and listen to a connection from a device.
     pub async fn serve(self) -> Result<(), HostError> {
         let (mut server, builder) = self.fields();
-        let service = builder.layer(WebSocketLayer).service(HostService);
+        let service = builder
+            .layer(WebSocketLayer)
+            .layer(ProtocolLayer)
+            .service(HostService);
 
         server.listen(service).await
     }

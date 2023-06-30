@@ -5,8 +5,9 @@ pub mod astarte;
 pub mod device;
 pub mod host;
 pub mod io_handler;
+pub mod protocol;
 pub mod shell;
-pub mod websocket;
+pub mod websocket; // Avoid importing tls module if TLS is not enabled
 
 #[cfg(feature = "tls")]
-pub mod tls; // Avoid importing tls module if TLS is not enabled
+pub mod tls;
