@@ -9,8 +9,6 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
-
 use futures::stream::SplitSink;
 use futures::{Future, SinkExt, StreamExt};
 use thiserror::Error;
@@ -18,12 +16,14 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::error::SendError;
 
+use tokio_tungstenite::tungstenite::error::{Error as TungError, ProtocolError};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use tower::layer::util::Stack;
 use tower::{layer::util::Identity, Service, ServiceBuilder};
-use tracing::{error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
+use crate::io_handler::IoHandler;
 use crate::protocol::{DeviceMsg, DeviceMsgStream, ProtocolLayer};
 use crate::websocket::WebSocketLayer;
 
@@ -35,7 +35,7 @@ use crate::tls::{self, Error as TlsError, TlsLayer};
 pub enum HostError {
     /// Error while trying to connect with a device.
     #[error("Error while trying to connect with a device.")]
-    WebSocketConnect(#[from] tokio_tungstenite::tungstenite::Error),
+    WebSocketConnect(#[from] TungError),
 
     /// Error while reading from stdin.
     #[error("IO error occurred while reading from stdin.")]
@@ -69,15 +69,23 @@ pub enum HostError {
 
     /// Error from Tungstenite while reading command.
     #[error("Error from Tungstenite while reading command.")]
-    TungsteniteReadData(#[source] tokio_tungstenite::tungstenite::Error),
+    TungsteniteReadData(#[source] TungError),
 
     /// Error from Tungstenite while closing websocket connection
     #[error("Error from Tungstenite while closing websocket connection")]
-    TungsteniteClose(#[source] tokio_tungstenite::tungstenite::Error),
+    TungsteniteClose(#[source] TungError),
 
-    /// Sender channel was dropped before sending message.
-    #[error("Sender channel was dropped before sending message.")]
-    ChannelDropped,
+    /// Wrong WebSocket message type.
+    #[error("Wrong WebSocket message type.")]
+    WrongWsMessage(tokio_tungstenite::tungstenite::Message),
+
+    /// Couldn't deserialize from BSON.
+    #[error("Couldn't deserialize from BSON.")]
+    Deserialize(#[from] bson::de::Error),
+
+    /// Couldn't serialize to BSON.
+    #[error("Couldn't serialize to BSON.")]
+    Serialize(#[from] bson::ser::Error),
 
     /// TLS error
     #[cfg(feature = "tls")]
@@ -113,7 +121,7 @@ impl Host {
     where
         S: Service<TcpStream, Error = HostError> + Clone + 'static,
     {
-        // TODO: find a way to handle multiple device connections
+        // TODO: find a way to handle multiple device connections -> define a task responsible for handling different connections and anothwer task (tokio::signal::ctrl_c()) to handle CTRL+C
         loop {
             let (stream, _) = self.listener.accept().await.map_err(HostError::Listen)?;
             info!("Connection accepted.");
@@ -166,7 +174,7 @@ impl HostBuilder<Identity> {
         let service = self
             .builder
             .layer(WebSocketLayer)
-            .layer(ProtocolLayer) // TODO: PROTOCOL (add also in the TLS serve() method)
+            .layer(ProtocolLayer)
             .service(HostService);
 
         self.host.listen(service).await
@@ -202,7 +210,7 @@ where
 /// Implement the necessary methods to handle a single connection with a device.
 /// The host sends commands, wait for device's answer and display it.
 pub struct HandleConnection<U> {
-    ws_stream: SplitSink<WebSocketStream<U>, Message>, // From<Protocol> for Message
+    ws_stream: SplitSink<WebSocketStream<U>, Message>,
     msg_stream: DeviceMsgStream,
 }
 
@@ -221,35 +229,71 @@ where
         }
     }
 
-    /// Connection handler
+    /// Connection handler.
     #[instrument(skip_all)]
-    pub async fn handle_connection(mut self) -> Result<(), HostError> {
-        // TODO: read from stdin
-        let mut buf = String::new();
-        let mut reader = BufReader::new(tokio::io::stdin());
-
-        let _byte_read = reader
-            .read_line(&mut buf)
-            .await
-            .map_err(HostError::IORead)?;
-
-        self.ws_stream
-            .send(Message::Binary(buf.as_bytes().to_vec()))
-            .await
-            .map_err(HostError::TungsteniteReadData)?;
-
-        while let Some(msg) = self.msg_stream.next().await {
-            let msg = msg?;
-            match msg {
-                DeviceMsg::Eof => {
-                    info!("EOF received");
-                    return Ok(());
-                }
-                _ => unimplemented!(), // TODO: implement receipt of a message output
+    async fn handle_connection(self) -> Result<(), HostError> {
+        match self.impl_handle_connection().await {
+            Ok(())
+            | Err(HostError::WebSocketConnect(TungError::Protocol(
+                ProtocolError::ResetWithoutClosingHandshake,
+            ))) => {
+                info!("Closing websocket connection due to device interruption");
+                // TODO: close ws connection
+                Ok(())
+            }
+            Err(err) => {
+                error!("Fatal error: {:?}", err);
+                // TODO: handle fatal errors
+                Err(err)
             }
         }
+    }
 
-        Ok(())
+    /// Implementation of a connection handler.
+    #[instrument(skip_all)]
+    async fn impl_handle_connection(mut self) -> Result<(), HostError> {
+        let mut io_handler = IoHandler::default();
+
+        loop {
+            debug!("Reading from stdin.");
+            let byte_read = io_handler.read_stdin().await?;
+
+            // check exit conditions
+            debug!(?byte_read);
+            if byte_read == 0 || io_handler.exited() {
+                // TODO: check if byte_read == 0 should be handled or not?
+                info!("Exit command or EOF received.");
+                self.ws_stream
+                    .send(Message::Close(None))
+                    .await
+                    .map_err(HostError::TungsteniteClose)?;
+            } else {
+                self.ws_stream
+                    .send(Message::Binary(io_handler.buf().as_bytes().to_vec()))
+                    .await
+                    .map_err(HostError::TungsteniteReadData)?;
+            }
+
+            // handle stream of messages coming from device
+            while let Some(msg) = self.msg_stream.next().await {
+                let msg = msg?;
+
+                match msg {
+                    DeviceMsg::Eof => {
+                        debug!("EOF received.");
+                        break;
+                    }
+                    DeviceMsg::Err(err) => {
+                        warn!("Error: {}", err);
+                        break;
+                    }
+                    DeviceMsg::Output(out) => {
+                        debug!("Received {} bytes", out.len());
+                        io_handler.write_stdout(out).await?
+                    }
+                }
+            }
+        }
 
         // let (write, read) = self.msg_stream.split();
 

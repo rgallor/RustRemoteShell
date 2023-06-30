@@ -9,21 +9,18 @@
 //! the communication between the device and a host.
 
 use std::path::PathBuf;
-use std::{fmt::Debug, io::ErrorKind, string::FromUtf8Error};
+use std::{fmt::Debug, string::FromUtf8Error};
 
 use futures::{future, SinkExt, StreamExt, TryStreamExt};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{error::ProtocolError, Message},
-    WebSocketStream,
-};
+use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream};
 use tokio_util::io::ReaderStream;
-use tracing::{error, info, instrument, warn};
+use tracing::{debug, error, info, instrument};
 use url::Url;
 
 use crate::astarte::{Error as AstarteError, HandleAstarteConnection};
+use crate::protocol::{DeviceMsg, HostMsg};
 use crate::shell::{CommandHandler, ShellError};
 #[cfg(feature = "tls")]
 use crate::tls::{self, Error as TlsError};
@@ -80,6 +77,18 @@ pub enum DeviceError {
     #[error("Shell error.")]
     Shell(#[from] ShellError),
 
+    /// Wrong WebSocket message type.
+    #[error("Wrong WebSocket message type.")]
+    WrongWsMessage(tokio_tungstenite::tungstenite::Message),
+
+    /// Couldn't deserialize from BSON.
+    #[error("Couldn't deserialize from BSON.")]
+    Deserialize(#[from] bson::de::Error),
+
+    /// Couldn't serialize to BSON.
+    #[error("Couldn't serialize to BSON.")]
+    Serialize(#[from] bson::ser::Error),
+
     /// TLS error
     #[cfg(feature = "tls")]
     #[error("Wrong item.")]
@@ -119,6 +128,8 @@ impl Device {
             })?;
 
         info!("Connection to Astarte established.");
+
+        // TODO: creare funzione handle_events e chiamarla in loop nel main
 
         // Wait for an aggregate datastream containing IP and port to connect to
         // TODO: define 1 task to loop over handle_events. spawn a new task for each host connection. Define a channel to handle errors (handled by the main task)
@@ -196,58 +207,89 @@ where
     U: AsyncRead + AsyncWrite + Unpin,
 {
     // separate ownership between receiving and writing part
-    let (write, read) = stream.split();
+    let (mut write, read) = stream.split();
 
     // Read the received command
-    let res = read
-        .map_err(DeviceError::Transport)
-        .and_then(|msg| async move {
-            info!("Received command from the client");
-            match msg {
-                // convert the message from a Vec<u8> into a OsString
-                Message::Binary(v) => String::from_utf8(v).map_err(DeviceError::Utf8Error),
-                Message::Close(_) => Err(DeviceError::CloseWebsocket), // the client closed the connection
-                _ => Err(DeviceError::ReadCommand),
+    let mut stream = read.map_err(DeviceError::Transport).and_then(|msg| {
+        debug!("Received command from the host, {:?}", msg);
+        future::ready(HostMsg::try_from(msg))
+    });
+
+    while let Some(res) = stream.next().await {
+        let cmd = res?;
+
+        let cmd = match cmd {
+            HostMsg::Command { cmd } => cmd,
+            HostMsg::Exit => {
+                write.close().await?;
+                return Ok(());
+            } // device exit -> // TODO: esci dal task relativo alla connessione device-host
+        };
+
+        let res = CommandHandler::execute(cmd).map_err(DeviceError::Shell);
+
+        let child_stdout = match res {
+            Ok(child_stdout) => child_stdout,
+            Err(DeviceError::Shell(err)) => {
+                // send EoF
+                debug!("Processing EOF.");
+                write
+                    .send(DeviceMsg::Err(err.to_string()).try_into()?)
+                    .await?;
+
+                continue;
+            } // avoid crushing the application because of a non-crytical shell error
+            _ => {
+                todo!("TODO: check if there are crytical error that must interrupt the application")
             }
-        })
-        .and_then(|cmd| async move {
-            // define a command handler
-            let cmd_handler = CommandHandler::default();
+        };
 
-            // TODO: Non ritornare ChildStdout. Piuttosto salvare ChildStdout come campo interno dello ShellHandler e poi definire una funzione stdout() che ritorna ChildStdout, da usare nella funzione ReaderStream::with_capacity.
-            // TODO: handle errors (look at shell.rs)
-            let child_stdout = cmd_handler.execute(cmd).map_err(DeviceError::Shell)?;
+        let mut msg_stream = ReaderStream::with_capacity(child_stdout, 1024)
+            .map_err(DeviceError::ChildStdout)
+            .and_then(|buf| {
+                let msg = DeviceMsg::Output(buf.to_vec());
 
-            let stream =
-                ReaderStream::with_capacity(child_stdout, 1024).map_err(DeviceError::ChildStdout);
+                match msg.try_into() {
+                    Ok(msg) => future::ok(msg),
+                    Err(err) => future::err(err),
+                }
+            });
 
-            Ok(stream)
-        })
-        .try_flatten()
-        .and_then(|bytes| future::ok(Message::Binary(bytes.to_vec())))
-        .forward(write.sink_map_err(DeviceError::Transport))
-        .await;
-
-    match res {
-        Ok(()) => Ok(()),
-        Err(
-            DeviceError::CloseWebsocket
-            | DeviceError::Transport(tokio_tungstenite::tungstenite::Error::Protocol(
-                ProtocolError::ResetWithoutClosingHandshake,
-            )),
-        ) => {
-            warn!("Websocket connection closed");
-            Ok(())
+        debug!("Processing msg stream.");
+        while let Some(msg) = msg_stream.next().await {
+            debug!(?msg);
+            write.send(msg?).await?;
         }
-        Err(DeviceError::Transport(tokio_tungstenite::tungstenite::Error::Io(err)))
-            if err.kind() == ErrorKind::UnexpectedEof =>
-        {
-            warn!("Websocket connection closed");
-            Ok(())
-        }
-        Err(err) => {
-            error!("Fatal error occurred: {}", err);
-            Err(err)
-        }
+
+        // send EoF
+        debug!("Processing EOF.");
+        write
+            .send(Message::Binary(bson::to_vec(&DeviceMsg::Eof)?))
+            .await?;
     }
+
+    Ok(())
+
+    // match res {
+    //     Ok(()) => Ok(()),
+    //     Err(
+    //         DeviceError::CloseWebsocket
+    //         | DeviceError::Transport(tokio_tungstenite::tungstenite::Error::Protocol(
+    //             ProtocolError::ResetWithoutClosingHandshake,
+    //         )),
+    //     ) => {
+    //         warn!("Websocket connection closed");
+    //         Ok(())
+    //     }
+    //     Err(DeviceError::Transport(tokio_tungstenite::tungstenite::Error::Io(err)))
+    //         if err.kind() == ErrorKind::UnexpectedEof =>
+    //     {
+    //         warn!("Websocket connection closed");
+    //         Ok(())
+    //     }
+    //     Err(err) => {
+    //         error!("Fatal error occurred: {}", err);
+    //         Err(err)
+    //     }
+    // }
 }

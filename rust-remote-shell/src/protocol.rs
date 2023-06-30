@@ -1,13 +1,19 @@
 //! Protocol used to describe the Host and Device actions after having established a connection.
 
-use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
+use futures::{stream::BoxStream, StreamExt, TryStreamExt};
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 use tower::{Layer, Service};
+use tracing::info;
 
-use crate::host::{HandleConnection, HostError};
+use crate::{
+    device::DeviceError,
+    host::{HandleConnection, HostError},
+};
 
 /// Enum used to describe the actions a device can make.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HostMsg {
     /// Close the WebSocket connection
     Exit,
@@ -18,12 +24,38 @@ pub enum HostMsg {
     },
 }
 
+impl TryFrom<Message> for HostMsg {
+    type Error = DeviceError;
+
+    fn try_from(value: Message) -> Result<Self, Self::Error> {
+        match value {
+            Message::Close(_) => Ok(HostMsg::Exit),
+            Message::Binary(cmd) => Ok(HostMsg::Command {
+                cmd: String::from_utf8_lossy(&cmd).to_string(),
+            }),
+            msg => Err(DeviceError::WrongWsMessage(msg)),
+        }
+    }
+}
+
 /// Enum used to describe the actions a host can make.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "t", content = "c")]
 pub enum DeviceMsg {
     /// The output of a command is ready
     Output(Vec<u8>),
     /// EOF received
     Eof,
+    /// Error
+    Err(String),
+}
+
+impl TryFrom<DeviceMsg> for Message {
+    type Error = DeviceError;
+
+    fn try_from(value: DeviceMsg) -> Result<Self, Self::Error> {
+        Ok(Message::Binary(bson::to_vec(&value)?))
+    }
 }
 
 /// Service introducing a protocol in the connection.
@@ -55,9 +87,10 @@ where
     fn call(&mut self, req: WebSocketStream<U>) -> Self::Future {
         let (write, read) = req.split();
 
+        // define a reader stream that maps a tungstenite Message into a DeviceMsg protocol message.
         let stream = read
-            .and_then(|_msg| future::ok(DeviceMsg::Eof)) // TODO: handle different message cases
             .map_err(HostError::from)
+            .and_then(handle_message) // handle different message cases
             .boxed();
 
         let handler = HandleConnection::new(stream, write);
@@ -74,5 +107,19 @@ impl<S> Layer<S> for ProtocolLayer {
 
     fn layer(&self, inner: S) -> Self::Service {
         ProtocolService { service: inner }
+    }
+}
+
+async fn handle_message(msg: Message) -> Result<DeviceMsg, HostError> {
+    match msg {
+        Message::Close(_) => {
+            info!("Closing WebSocket connection.");
+            Ok(DeviceMsg::Eof)
+        }
+        Message::Binary(v) => {
+            let msg: DeviceMsg = bson::from_slice(&v)?;
+            Ok(msg)
+        }
+        msg => Err(HostError::WrongWsMessage(msg)),
     }
 }
