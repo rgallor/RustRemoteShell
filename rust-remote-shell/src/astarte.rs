@@ -187,7 +187,7 @@ impl HandleAstarteConnection {
 
     /// Parse an `HashMap` containig pairs (Endpoint, [`AstarteType`]) into an URL.
     #[instrument(skip_all)]
-    pub fn retrieve_url(&self, map: &HashMap<String, AstarteType>) -> Result<Url, Error> {
+    pub fn retrieve_url(map: &HashMap<String, AstarteType>) -> Result<Url, Error> {
         let scheme = map
             .get("scheme")
             .ok_or_else(|| Error::MissingUrlInfo("Missing scheme".to_string()))?;

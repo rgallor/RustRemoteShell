@@ -9,33 +9,31 @@
 //! the communication between the device and a host.
 
 use std::path::PathBuf;
-use std::{fmt::Debug, string::FromUtf8Error};
 
+use std::fmt::Debug;
+
+use astarte_device_sdk::AstarteDeviceSdk;
 use futures::{future, SinkExt, StreamExt, TryStreamExt};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream};
+use tokio::sync::mpsc::error::SendError;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::task::{JoinError, JoinSet};
+use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 use tokio_util::io::ReaderStream;
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 use url::Url;
 
 use crate::astarte::{Error as AstarteError, HandleAstarteConnection};
 use crate::protocol::{DeviceMsg, HostMsg};
 use crate::shell::{CommandHandler, ShellError};
+
 #[cfg(feature = "tls")]
 use crate::tls::{self, Error as TlsError};
 
 /// Device errors.
 #[derive(Error, Debug)]
 pub enum DeviceError {
-    /// Error while reading the shell command from websocket.
-    #[error("Error while reading the shell command from websocket.")]
-    ReadCommand,
-
-    /// Error marshaling to UTF8.
-    #[error("Error marshaling to UTF8.")]
-    Utf8Error(#[from] FromUtf8Error),
-
     ///Trasport error from Tungstenite.
     #[error("Trasport error from Tungstenite.")]
     Transport(#[from] tokio_tungstenite::tungstenite::Error),
@@ -44,24 +42,21 @@ pub enum DeviceError {
     #[error("Error while trying to connect with the host.")]
     WebSocketConnect(#[source] tokio_tungstenite::tungstenite::Error),
 
-    /// Close websocket connection.
-    ///
-    /// This is not an error. Instead, when a device wants to close a connection
-    /// it sends a CloseWebsocket error.
-    #[error("Close websocket connection.")]
-    CloseWebsocket,
-
     /// Wrong scheme received.
     #[error("Wrong scheme, {0}.")]
     WrongScheme(String),
 
-    /// Error while reading from file.
-    #[error("Error while reading from file.")]
-    ReadFile(#[source] std::io::Error),
-
     /// Error while reading stdout from child process executing the shell command.
     #[error("Error while reading from child process's stdout.")]
     ChildStdout(#[source] std::io::Error),
+
+    /// Error while sending an URL across tasks.
+    #[error("Error while sending an URL across tasks.")]
+    Channel(#[from] SendError<Url>),
+
+    /// Error while joining a tokio task.
+    #[error("Error while joining a tokio task.")]
+    Join(#[from] JoinError),
 
     /// [`AstarteError`] error.
     #[error("Astarte error, {}.", msg)]
@@ -102,7 +97,8 @@ pub enum DeviceError {
 /// the connection with a host, eventually adding TLS configuration.
 #[derive(Clone, Debug)]
 pub struct Device {
-    url: Url,
+    astarte_device: AstarteDeviceSdk,
+    ca_cert_file: Option<PathBuf>,
 }
 
 impl Device {
@@ -119,7 +115,7 @@ impl Device {
                 msg: "wrong device config".to_string(),
             })?;
 
-        let mut device = handle_astarte
+        let astarte_device = handle_astarte
             .create_astarte_device(&cfg)
             .await
             .map_err(|err| DeviceError::Astarte {
@@ -129,46 +125,130 @@ impl Device {
 
         info!("Connection to Astarte established.");
 
-        // TODO: creare funzione handle_events e chiamarla in loop nel main
+        Ok(Self {
+            astarte_device,
+            ca_cert_file: None,
+        })
+    }
 
-        // Wait for an aggregate datastream containing IP and port to connect to
-        // TODO: define 1 task to loop over handle_events. spawn a new task for each host connection. Define a channel to handle errors (handled by the main task)
-        match device.handle_events().await {
-            Ok(data) => {
-                if let astarte_device_sdk::Aggregation::Object(map) = data.data {
-                    let url =
-                        handle_astarte
-                            .retrieve_url(&map)
-                            .map_err(|err| DeviceError::Astarte {
-                                err,
-                                msg: "failed to retrieve the url".to_string(),
-                            })?;
-                    info!("Connecting to {}", url);
-                    Ok(Self { url })
-                } else {
-                    Err(DeviceError::Astarte {
-                        err: AstarteError::AstarteWrongAggregation,
-                        msg: "received wrong astarte type".to_string(),
-                    })
+    /// Provide CA cert file to the device in order to open a TLS connection with a host.
+    #[cfg(feature = "tls")]
+    pub fn with_tls(&mut self, ca_cert_file: Option<PathBuf>) {
+        self.ca_cert_file = ca_cert_file
+    }
+
+    /// Start the device.
+    ///
+    /// A device that is started will try to connect with hosts after having received from Astarte the host URL.
+    #[instrument(skip_all)]
+    pub async fn start(self) -> Result<(), DeviceError> {
+        debug!("spawning a task to handle new connections");
+        let (tx_url, rx_url) = unbounded_channel::<Url>();
+
+        // define a task to handle astarte events and send the received URL to the task responsible for the creation of new connections
+        let handle_astarte =
+            tokio::spawn(Device::handle_astarte_events(self.astarte_device, tx_url));
+
+        // define a task to handle new connections after having received an URL from the task respponsible for handling astarte events
+        Device::handle_connections(rx_url, self.ca_cert_file).await;
+
+        handle_astarte.await.map_err(DeviceError::Join)?
+    }
+
+    /// Handle a single Astarte event.
+    async fn handle_astarte_events(
+        mut astarte_device: AstarteDeviceSdk,
+        tx_url: UnboundedSender<Url>,
+    ) -> Result<(), DeviceError> {
+        loop {
+            // Wait for an aggregate datastream containing a scheme, an IP and a port number to connect to
+            match astarte_device.handle_events().await {
+                Ok(data) => {
+                    match data.data {
+                        astarte_device_sdk::Aggregation::Object(map) if data.path == "/rshell" => {
+                            let url =
+                                HandleAstarteConnection::retrieve_url(&map).map_err(|err| {
+                                    DeviceError::Astarte {
+                                        err,
+                                        msg: "failed to retrieve the url".to_string(),
+                                    }
+                                })?;
+                            info!("received url: {}", url);
+
+                            // send the retrieved URL to the task responsible for the creation of a new connection
+                            tx_url.send(url).map_err(DeviceError::Channel)?;
+                        }
+                        _ => {
+                            // when an error is returned, tx_url is dropped. This is fundamental because the task
+                            // responsible for handling the connections will stop spawning other connections
+                            // after having received None from the channel
+                            return Err(DeviceError::Astarte {
+                                err: AstarteError::AstarteWrongAggregation,
+                                msg: "received wrong astarte type".to_string(),
+                            });
+                        }
+                    }
                 }
-            }
-            Err(err) => {
-                error!("Astarte error: {:?}", err);
-                Err(DeviceError::Astarte {
-                    err: AstarteError::AstarteHandleEvent(err),
-                    msg: "failed to handle astarte event".to_string(),
-                })
+                // If the device get disconnected from Astarte, it will loop untill it is reconnected
+                Err(err @ astarte_device_sdk::AstarteError::ConnectionError(_)) => {
+                    warn!("Connection err  {:#?}", err);
+                }
+                Err(err) => {
+                    error!("Astarte error: {:?}", err);
+                    return Err(DeviceError::Astarte {
+                        err: AstarteError::AstarteHandleEvent(err),
+                        msg: "failed to handle astarte event".to_string(),
+                    });
+                }
             }
         }
     }
 
     /// Connect to a host by using a TLS connection.
+    async fn handle_connections(mut rx_url: UnboundedReceiver<Url>, ca_cert_file: Option<PathBuf>) {
+        // define a set of tasks, each responsible for handling a connection with a host
+        let mut handles = JoinSet::new();
+
+        // when the channel is dropped, that is when the astarte task fails, the rx_url.recv() statement
+        // returns None and the while loop terminates
+        debug!("waiting to receive an URL");
+        while let Some(url) = rx_url.recv().await {
+            debug!("received an URL, {}", url);
+            handles.spawn(Device::handle_connection(url, ca_cert_file.clone()));
+        }
+
+        // await the other connections to terminate before returning
+        // Note: errors are not propagated to avoid aborting the exisitn connections
+        while let Some(res) = handles.join_next().await {
+            match res {
+                Ok(Ok(())) => {}
+                Err(err) => {
+                    error!("Join handle error: {}", err);
+                }
+                Ok(Err(err)) => {
+                    error!("device error, {:#?}", err);
+                }
+            }
+        }
+    }
+
     #[cfg(feature = "tls")]
-    pub async fn connect_tls(&mut self, ca_cert_file: Option<PathBuf>) -> Result<(), DeviceError> {
-        let ws_stream = match self.url.scheme() {
+    async fn handle_connection(url: Url, ca_cert_file: Option<PathBuf>) -> Result<(), DeviceError> {
+        // in case of a TLS connection, it is possible to receive either "ws" or "wss" as acceptable url scheme
+        let ws_stream = match url.scheme() {
             "wss" => {
                 let connector = tls::device_tls_config(ca_cert_file)?; // Connector::Rustls
-                tls::connect(&self.url, Some(connector)).await?
+                tls::connect(&url, Some(connector)).await?
+            }
+            "ws" => {
+                let (ws_stream, _) =
+                    tokio_tungstenite::connect_async(&url)
+                        .await
+                        .map_err(|err| {
+                            error!("Websocket error: {:?}", err);
+                            DeviceError::WebSocketConnect(err)
+                        })?;
+                ws_stream
             }
             scheme => {
                 return Err(DeviceError::WrongScheme(scheme.to_string()));
@@ -179,14 +259,21 @@ impl Device {
     }
 
     /// Connect to a host by using a plain TCP connection
+    #[cfg(not(feature = "tls"))]
     #[instrument(skip_all)]
-    pub async fn connect(&mut self) -> Result<(), DeviceError> {
-        let ws_stream = match self.url.scheme() {
+    async fn handle_connection(
+        url: Url,
+        _ca_cert_file: Option<PathBuf>,
+    ) -> Result<(), DeviceError> {
+        let ws_stream = match url.scheme() {
             "ws" => {
-                let (ws_stream, _) = connect_async(&self.url).await.map_err(|err| {
-                    error!("Websocket error: {:?}", err);
-                    DeviceError::WebSocketConnect(err)
-                })?;
+                let (ws_stream, _) =
+                    tokio_tungstenite::connect_async(&url)
+                        .await
+                        .map_err(|err| {
+                            error!("Websocket error: {:?}", err);
+                            DeviceError::WebSocketConnect(err)
+                        })?;
                 ws_stream
             }
             scheme => {
@@ -210,10 +297,9 @@ where
     let (mut write, read) = stream.split();
 
     // Read the received command
-    let mut stream = read.map_err(DeviceError::Transport).and_then(|msg| {
-        debug!("Received command from the host, {:?}", msg);
-        future::ready(HostMsg::try_from(msg))
-    });
+    let mut stream = read
+        .map_err(DeviceError::Transport)
+        .and_then(|msg| future::ready(HostMsg::try_from(msg)));
 
     while let Some(res) = stream.next().await {
         let cmd = res?;
@@ -221,9 +307,10 @@ where
         let cmd = match cmd {
             HostMsg::Command { cmd } => cmd,
             HostMsg::Exit => {
+                info!("closing connection with host");
                 write.close().await?;
                 return Ok(());
-            } // device exit -> // TODO: esci dal task relativo alla connessione device-host
+            }
         };
 
         let res = CommandHandler::execute(cmd).map_err(DeviceError::Shell);
@@ -257,7 +344,6 @@ where
 
         debug!("Processing msg stream.");
         while let Some(msg) = msg_stream.next().await {
-            debug!(?msg);
             write.send(msg?).await?;
         }
 
@@ -269,27 +355,4 @@ where
     }
 
     Ok(())
-
-    // match res {
-    //     Ok(()) => Ok(()),
-    //     Err(
-    //         DeviceError::CloseWebsocket
-    //         | DeviceError::Transport(tokio_tungstenite::tungstenite::Error::Protocol(
-    //             ProtocolError::ResetWithoutClosingHandshake,
-    //         )),
-    //     ) => {
-    //         warn!("Websocket connection closed");
-    //         Ok(())
-    //     }
-    //     Err(DeviceError::Transport(tokio_tungstenite::tungstenite::Error::Io(err)))
-    //         if err.kind() == ErrorKind::UnexpectedEof =>
-    //     {
-    //         warn!("Websocket connection closed");
-    //         Ok(())
-    //     }
-    //     Err(err) => {
-    //         error!("Fatal error occurred: {}", err);
-    //         Err(err)
-    //     }
-    // }
 }

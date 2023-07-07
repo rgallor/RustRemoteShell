@@ -44,14 +44,16 @@ pub enum Error {
     WrongItem,
 
     /// Error while establishing a TLS connection.
-    #[cfg(feature = "tls")]
     #[error("Error while establishing a TLS connection.")]
     RustTls(#[from] tokio_rustls::rustls::Error),
 
     /// Error while accepting a TLS connection.
-    #[cfg(feature = "tls")]
     #[error("Error while accepting a TLS connection.")]
     AcceptTls(#[source] std::io::Error),
+
+    /// Error while reading from file.
+    #[error("Error while reading from file.")]
+    ReadFile(#[source] std::io::Error),
 }
 
 /// Given the host certificate and private key, return the TLS configuration for the host.
@@ -116,14 +118,14 @@ pub fn device_tls_config(ca_cert_file: Option<PathBuf>) -> Result<Connector, Dev
     let mut root_certs = RootCertStore::empty();
 
     if let Some(ca_cert_file) = ca_cert_file {
-        let file = std::fs::File::open(ca_cert_file).map_err(DeviceError::ReadFile)?;
+        let file = std::fs::File::open(ca_cert_file)
+            .map_err(|err| DeviceError::Tls(Error::ReadFile(err)))?;
         let mut reader = BufReader::new(file);
 
-        for item in read_all(&mut reader).map_err(DeviceError::ReadFile)? {
+        for item in read_all(&mut reader).map_err(|err| DeviceError::Tls(Error::ReadFile(err)))? {
             match item {
                 Item::X509Certificate(ca_cert) => {
                     let cert = Certificate(ca_cert);
-                    debug!("{:?}", cert);
                     root_certs
                         .add(&cert)
                         .expect("failed to add CA cert to the root certs");
@@ -168,7 +170,7 @@ pub async fn connect(
 /// TLS [`tower`] service.
 ///
 /// This service add a [`TlsLayer`] on top of a tower stack.
-///  It is responsible for the handling of a TLS connection.
+/// It is responsible for the handling of a TLS connection.
 #[derive(Clone)]
 pub struct TlsService<S> {
     service: S,

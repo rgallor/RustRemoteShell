@@ -67,9 +67,6 @@ impl IoHandler {
 
         self.stdout.flush().await.map_err(HostError::IOWrite)?;
 
-        // // if the channel still contains information, empty it before aborting the task
-        // self.empty_buffer(channel).await?;
-
         Ok(())
     }
 }

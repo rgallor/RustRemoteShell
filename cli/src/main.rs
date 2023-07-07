@@ -86,12 +86,13 @@ async fn main() -> Result<()> {
             // astartectl appengine --appengine-url http://localhost:4002/ --realm-management-url http://localhost:4000/ --realm-key test_private.pem --realm-name test devices send-data 2TBn-jNESuuHamE2Zo1anA org.astarte-platform.rust-remote-shell.ConnectToHost /rshell '{"scheme" : "ws", "host" : "127.0.0.1", "port" : 8080}'
             let mut device = Device::new(device_cfg_path.as_str()).await?;
 
+            // TODO: at the moment we are using the same CA for different hosts, which is wrong.
+            // SOLUTION: use astarte send_data to send the CA and retrieve it as an AstarteType of String's array.
             if tls_enabled {
-                // if an error occurred while reading the certficate, only webpki certs will be included into the root_certs
-                device.connect_tls(ca_cert_file).await?;
-            } else {
-                device.connect().await?;
+                device.with_tls(ca_cert_file);
             }
+
+            device.start().await?;
         }
     }
 

@@ -15,11 +15,11 @@ use crate::{
 /// Enum used to describe the actions a device can make.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HostMsg {
-    /// Close the WebSocket connection
+    /// Close the WebSocket connection.
     Exit,
-    /// Execute a command
+    /// Execute a command.
     Command {
-        /// Command to execute
+        /// Command to execute.
         cmd: String,
     },
 }
@@ -42,11 +42,11 @@ impl TryFrom<Message> for HostMsg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", content = "c")]
 pub enum DeviceMsg {
-    /// The output of a command is ready
+    /// The output of a command is ready.
     Output(Vec<u8>),
-    /// EOF received
+    /// EOF received.
     Eof,
-    /// Error
+    /// Error.
     Err(String),
 }
 
