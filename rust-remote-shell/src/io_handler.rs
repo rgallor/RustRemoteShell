@@ -7,7 +7,7 @@
 //! * closing the WebSocket connection between the device and the host.
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Stdin, Stdout};
-use tracing::{instrument, warn};
+use tracing::{info, instrument};
 
 use crate::host::HostError;
 
@@ -37,23 +37,24 @@ impl IoHandler {
 
     /// Read the command from the stdin and send it to the device.
     #[instrument(skip_all)]
-    pub async fn read_stdin(&mut self) -> Result<usize, HostError> {
+    pub async fn read_stdin(&mut self) -> Result<Option<&str>, HostError> {
         // empty the buffer so to be able to store incoming command
         self.buf.clear();
 
-        let byte_read = self
+        let _byte_read = self
             .reader
             .read_line(&mut self.buf)
             .await
             .map_err(HostError::IORead)?;
 
-        Ok(byte_read)
-    }
+        info!(?self.buf);
 
-    /// Termination condition in case the host sent "exit".
-    #[instrument(skip_all)]
-    pub fn exited(&self) -> bool {
-        matches!(self.buf.split_ascii_whitespace().next(), Some(cmd) if cmd == "exit")
+        if self.buf.trim() == "exit" {
+            // termination condition when calling this method in a loop
+            return Ok(None);
+        }
+
+        Ok(Some(&self.buf))
     }
 
     /// Write the command output to the stdout.

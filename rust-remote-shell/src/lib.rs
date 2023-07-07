@@ -7,6 +7,7 @@ pub mod host;
 pub mod io_handler;
 pub mod protocol;
 pub mod shell;
+mod stream;
 pub mod websocket;
 
 // Avoid importing tls module if TLS is not enabled

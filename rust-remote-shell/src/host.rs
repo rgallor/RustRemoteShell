@@ -10,22 +10,25 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 
-use futures::stream::SplitSink;
 use futures::{Future, SinkExt, StreamExt};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::signal;
 use tokio::sync::mpsc::error::SendError;
 
+use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::error::{Error as TungError, ProtocolError};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
+
 use tower::layer::util::Stack;
 use tower::{layer::util::Identity, Service, ServiceBuilder};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::io_handler::IoHandler;
-use crate::protocol::{DeviceMsg, DeviceMsgStream, ProtocolLayer};
+use crate::protocol::{DeviceMsg, HostMsg, ProtocolLayer};
+use crate::stream::MessageHandler;
 use crate::websocket::WebSocketLayer;
 
 #[cfg(feature = "tls")]
@@ -122,13 +125,14 @@ impl Host {
     where
         S: Service<TcpStream, Error = HostError> + Clone + 'static,
     {
-        // TODO: define a task responsible for handling different connections and anothwer task (tokio::signal::ctrl_c()) to handle CTRL+C
         loop {
             let (stream, _) = self.listener.accept().await.map_err(HostError::Listen)?;
             info!("Connection accepted.");
             // handle the connection by sending messages and printing out responses from the device
             match service.call(stream).await {
-                Ok(_) => {}
+                Ok(_) => {
+                    info!("connection closed");
+                }
                 Err(err) => {
                     Self::handle_error(err)?;
                 }
@@ -141,7 +145,7 @@ impl Host {
         match err {
             #[cfg(feature = "tls")]
             HostError::Tls(tls_err @ TlsError::AcceptTls(_)) => {
-                error!("Connection discareder due to tls error: {}", tls_err);
+                error!("Connection discarded due to tls error: {}", tls_err);
                 Ok(())
             }
             err => Err(err),
@@ -228,8 +232,14 @@ where
 /// Implement the necessary methods to handle a single connection with a device.
 /// The host sends commands, wait for device's answer and display it.
 pub struct HandleConnection<U> {
-    ws_stream: SplitSink<WebSocketStream<U>, Message>,
-    msg_stream: DeviceMsgStream,
+    ws_stream: MessageHandler<U>,
+    ctrl_c: JoinHandle<()>,
+}
+
+impl<U> Drop for HandleConnection<U> {
+    fn drop(&mut self) {
+        self.ctrl_c.abort();
+    }
 }
 
 impl<U> HandleConnection<U>
@@ -237,14 +247,39 @@ where
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     /// Create a new handler for a connection.
-    pub fn new(
-        msg_stream: DeviceMsgStream,
-        ws_stream: SplitSink<WebSocketStream<U>, Message>,
-    ) -> Self {
-        Self {
-            ws_stream,
-            msg_stream,
-        }
+    pub(crate) fn new(ws_stream: WebSocketStream<U>) -> Self {
+        let ws_stream = MessageHandler::new(ws_stream);
+
+        // spawn the task to handle the reception of CTRL C (SIGINT) signal
+        let ctrl_c = HandleConnection::ctrl_c_handler(ws_stream.clone());
+
+        Self { ws_stream, ctrl_c }
+    }
+
+    fn ctrl_c_handler(ws_stream: MessageHandler<U>) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                if let Err(err) = signal::ctrl_c().await {
+                    error!("CTRL C error: {}", err);
+                }
+
+                let msg = match HostMsg::Ctrlc.try_into() {
+                    Err(err) => {
+                        error!("Error converting HostMsg::Ctrlc into Message, {:?}", err);
+                        return;
+                    }
+                    Ok(msg) => msg,
+                };
+
+                // send CTRL C to the device
+                // Take the sink part of the websocket connection and send CTRL C message.
+                if let Err(err) = ws_stream.sink().await.send(msg).await {
+                    error!("Error sending CTRL C Message to device: {}", err);
+                }
+
+                debug!("CTRL C sent");
+            }
+        })
     }
 
     /// Connection handler.
@@ -284,27 +319,21 @@ where
     async fn impl_handle_connection(mut self) -> Result<(), HostError> {
         let mut io_handler = IoHandler::default();
 
-        loop {
-            debug!("Reading from stdin.");
-            let byte_read = io_handler.read_stdin().await?;
+        // if exit, read_stdin() returns Ok(None)
+        while let Some(cmd) = io_handler.read_stdin().await? {
+            let msg = HostMsg::Command {
+                cmd: cmd.to_string(),
+            };
 
-            // check exit conditions
-            debug!(?byte_read);
-            if byte_read == 0 || io_handler.exited() {
-                info!("Exit command or EOF received.");
-                self.ws_stream
-                    .send(Message::Close(None))
-                    .await
-                    .map_err(HostError::TungsteniteClose)?;
-            } else {
-                self.ws_stream
-                    .send(Message::Binary(io_handler.buf().as_bytes().to_vec()))
-                    .await
-                    .map_err(HostError::TungsteniteReadData)?;
-            }
+            self.ws_stream
+                .sink()
+                .await
+                .send(msg.try_into()?)
+                .await
+                .map_err(HostError::TungsteniteReadData)?;
 
             // handle stream of messages coming from device
-            while let Some(msg) = self.msg_stream.next().await {
+            while let Some(msg) = self.ws_stream.next().await {
                 let msg = msg?;
 
                 match msg {
@@ -313,7 +342,7 @@ where
                         break;
                     }
                     DeviceMsg::Err(err) => {
-                        warn!("Error: {}", err);
+                        warn!("{}", err);
                         break;
                     }
                     DeviceMsg::Output(out) => {
@@ -323,5 +352,11 @@ where
                 }
             }
         }
+
+        info!("Exit command or EOF received.");
+
+        self.ws_stream.close().await?;
+
+        Ok(())
     }
 }

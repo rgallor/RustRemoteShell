@@ -8,16 +8,18 @@
 //! The module also provides the [`device_handle`] function, responsible for handling
 //! the communication between the device and a host.
 
-use std::path::PathBuf;
-
 use std::fmt::Debug;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use astarte_device_sdk::AstarteDeviceSdk;
+use futures::stream::SplitSink;
 use futures::{future, SinkExt, StreamExt, TryStreamExt};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::Mutex;
 use tokio::task::{JoinError, JoinSet};
 use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 use tokio_util::io::ReaderStream;
@@ -221,7 +223,9 @@ impl Device {
         // Note: errors are not propagated to avoid aborting the exisitn connections
         while let Some(res) = handles.join_next().await {
             match res {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    info!("connection with host closed");
+                }
                 Err(err) => {
                     error!("Join handle error: {}", err);
                 }
@@ -291,29 +295,114 @@ impl Device {
 #[instrument(skip_all)]
 pub async fn device_handle<U>(stream: WebSocketStream<U>) -> Result<(), DeviceError>
 where
-    U: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     // separate ownership between receiving and writing part
-    let (mut write, read) = stream.split();
+    let (write, read) = stream.split();
+    let write = Arc::new(Mutex::new(write));
 
-    // Read the received command
+    // map the Websocket stream of Messages into a stream of HostMsg
     let mut stream = read
         .map_err(DeviceError::Transport)
         .and_then(|msg| future::ready(HostMsg::try_from(msg)));
 
-    while let Some(res) = stream.next().await {
-        let cmd = res?;
+    // define the command handler
+    let cmd_handler = Arc::new(Mutex::new(CommandHandler::default()));
 
+    // channel used to pass HostMsg between tasks
+    let (tx_host_msg, rx_host_msg) = unbounded_channel::<HostMsg>();
+
+    let write_clone = Arc::clone(&write);
+    let cmd_handler_clone = Arc::clone(&cmd_handler);
+
+    // task responsible for handling HostMsg
+    let handle = tokio::spawn(handle_host_msgs(
+        rx_host_msg,
+        write_clone,
+        cmd_handler_clone,
+    ));
+
+    // the main task is responsible for retrieving incoming Messages, converting them into HostMsg,
+    // handling eventual CTRL C events and sending HostMsg to the task responsible for their handling
+    while let Some(res) = stream.next().await {
+        let host_msg = match res {
+            Ok(msg) => msg,
+            Err(err) => return Err(err),
+        };
+
+        // if CTRL C is received, stop the currently executed command
+        if let HostMsg::Ctrlc = host_msg {
+            match cmd_handler.lock().await.ctrl_c().await {
+                Ok(()) => {
+                    info!("Command execution interrupted");
+                    continue; // wait for the next HostMsg
+                }
+                Err(ShellError::NoCommand) => {
+                    warn!("Received CTRL C without executing any command, closing connection with host");
+                    close_connection(&write).await?;
+                    handle.abort();
+                    break;
+                }
+                Err(err) => {
+                    error!("error while processing CTRL C, {:#?}", err);
+                    close_connection(&write).await?;
+                    handle.abort();
+                    // TODO: check if the connection should be closed even in this case
+                    break;
+                }
+            }
+        }
+
+        // queue the HostMsg so that the task responsible for HostMsg handling can proceed
+        tx_host_msg
+            .send(host_msg)
+            .expect("error while sending HostMsg over channel");
+    }
+
+    match handle.await {
+        Ok(Ok(())) => debug!("task terminated"),
+        Err(err) if err.is_cancelled() => {
+            debug!("task terminated with CTRL C")
+        }
+        Err(err) => {
+            error!("Join handle error: {}", err);
+        }
+        Ok(Err(err)) => {
+            error!("device error, {:#?}", err);
+            return Err(err);
+        }
+    }
+
+    Ok(())
+}
+
+#[instrument(skip_all)]
+async fn handle_host_msgs<U>(
+    mut rx_host_msg: UnboundedReceiver<HostMsg>,
+    write: Arc<Mutex<SplitSink<WebSocketStream<U>, Message>>>,
+    cmd_handler: Arc<Mutex<CommandHandler>>,
+) -> Result<(), DeviceError>
+where
+    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    while let Some(cmd) = rx_host_msg.recv().await {
         let cmd = match cmd {
             HostMsg::Command { cmd } => cmd,
             HostMsg::Exit => {
                 info!("closing connection with host");
-                write.close().await?;
-                return Ok(());
+                write.lock().await.close().await?;
+                return Ok::<(), DeviceError>(());
+            }
+            HostMsg::Ctrlc => {
+                unreachable!("should have been already handled in handle_stream task")
             }
         };
 
-        let res = CommandHandler::execute(cmd).map_err(DeviceError::Shell);
+        let res = cmd_handler
+            .lock()
+            .await
+            .execute(cmd)
+            .map_err(DeviceError::Shell);
 
         let child_stdout = match res {
             Ok(child_stdout) => child_stdout,
@@ -321,17 +410,19 @@ where
                 // send EoF
                 debug!("Processing EOF.");
                 write
+                    .lock()
+                    .await
                     .send(DeviceMsg::Err(err.to_string()).try_into()?)
                     .await?;
 
                 continue;
-            } // avoid crushing the application because of a non-crytical shell error
+            }
             _ => {
                 todo!("TODO: check if there are crytical error that must interrupt the application")
             }
         };
 
-        let mut msg_stream = ReaderStream::with_capacity(child_stdout, 1024)
+        ReaderStream::with_capacity(child_stdout, 1024)
             .map_err(DeviceError::ChildStdout)
             .and_then(|buf| {
                 let msg = DeviceMsg::Output(buf.to_vec());
@@ -340,19 +431,50 @@ where
                     Ok(msg) => future::ok(msg),
                     Err(err) => future::err(err),
                 }
-            });
+            })
+            .try_for_each(|msg| {
+                let write = Arc::clone(&write);
+                async move {
+                    write
+                        .lock()
+                        .await
+                        .send(msg)
+                        .await
+                        .map_err(DeviceError::from)
+                }
+            })
+            .await?;
 
-        debug!("Processing msg stream.");
-        while let Some(msg) = msg_stream.next().await {
-            write.send(msg?).await?;
-        }
+        // the command has finished being executed, therefore the child process stored insidet che command_handler can be set to None
+        cmd_handler.lock().await.empty();
 
         // send EoF
         debug!("Processing EOF.");
         write
+            .lock()
+            .await
             .send(Message::Binary(bson::to_vec(&DeviceMsg::Eof)?))
             .await?;
     }
+
+    Ok(())
+}
+
+#[instrument(skip_all)]
+async fn close_connection<U>(
+    write: &Mutex<SplitSink<WebSocketStream<U>, Message>>,
+) -> Result<(), DeviceError>
+where
+    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut write = write.lock().await;
+    write.send(Message::Close(None)).await?;
+
+    debug!("sent close message");
+
+    write.close().await?;
+
+    debug!("channel closed");
 
     Ok(())
 }
