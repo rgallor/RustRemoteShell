@@ -83,7 +83,7 @@ impl CommandHandler {
         let stdout = self
             .child
             .as_mut()
-            .expect("child must have been initialized")
+            .unwrap() // it has certainly been initialized
             .stdout
             .take()
             .ok_or(ShellError::RetrieveStdout)?;
@@ -91,7 +91,7 @@ impl CommandHandler {
         Ok(stdout)
     }
 
-    /// Set the Child process to None.
+    /// Set the Child process responsible for executing a command to None.
     ///
     /// This method is usefull in case a CTRL C command is received, making it possible
     /// to avoid interrupting an already executed command.
@@ -99,14 +99,10 @@ impl CommandHandler {
         self.child = None;
     }
 
-    /// Kill the process responsible for handling a command in case of a CTRL C
+    /// Kill the process responsible for handling a command in case a CTRL C signal is received.
     pub async fn ctrl_c(&mut self) -> Result<(), ShellError> {
-        match self.child {
-            Some(_) => {
-                let mut child = self.child.take().unwrap();
-                Ok(child.kill().await?)
-            }
-            None => Err(ShellError::NoCommand),
-        }
+        let mut child = self.child.take().ok_or(ShellError::NoCommand)?;
+        child.kill().await?;
+        Ok(())
     }
 }

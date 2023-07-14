@@ -1,10 +1,10 @@
 #![warn(missing_docs)]
-#![doc = include_str!("../README.md")] // TODO: Add crate information in the README
+#![doc = include_str!("../README.md")]
 
 pub mod astarte;
+pub mod command;
 pub mod device;
 pub mod host;
-pub mod io_handler;
 pub mod protocol;
 pub mod shell;
 mod stream;

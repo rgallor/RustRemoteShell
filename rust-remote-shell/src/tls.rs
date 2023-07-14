@@ -1,4 +1,4 @@
-//! TLS functionality.
+//! Module implementing TLS functionality.
 //!
 //! This module provides the necessary functionalities to add a TLS layer on top of the communication between a device and a host.
 //! The [`host_tls_config`] and [`acceptor`] functions allow to set the TLS configuration for a
@@ -8,17 +8,20 @@
 //!
 //! The module also contains the [`TlsService`] and [`TlsLayer`] struct, necessary to implement a Tls layer in the [`tower`] stack.
 
-use futures::Future;
+use futures::future::Either;
+use futures::{ready, Future, FutureExt};
 
 use rustls_pemfile::{read_all, read_one, Item};
 use std::io::BufReader;
+use std::task::Poll;
+use tokio_rustls::{webpki, Accept};
+use tower::make::MakeConnection;
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls::{
     Certificate, ClientConfig, OwnedTrustAnchor, PrivateKey, RootCertStore,
 };
@@ -26,15 +29,13 @@ use tokio_rustls::{server::TlsStream, TlsAcceptor};
 use tokio_tungstenite::{
     connect_async_tls_with_config, Connector, MaybeTlsStream, WebSocketStream,
 };
-use tower::layer::util::{Identity, Stack};
 use tower::{Layer, Service};
-use tracing::{debug, instrument};
+use tracing::{debug, error, instrument};
 use url::Url;
 
 use crate::device::DeviceError;
-use crate::host::{HostBuilder, HostError};
-use crate::protocol::ProtocolLayer;
-use crate::{host::HostService, websocket::WebSocketLayer};
+use crate::host::HostError;
+use crate::websocket::TcpAccept;
 
 /// TLS errora
 #[derive(Error, Debug)]
@@ -54,6 +55,10 @@ pub enum Error {
     /// Error while reading from file.
     #[error("Error while reading from file.")]
     ReadFile(#[source] std::io::Error),
+
+    /// Failed to add CA cert to the root certs.
+    #[error("Failed to add CA cert to the root certs.")]
+    RootCert(#[from] webpki::Error),
 }
 
 /// Given the host certificate and private key, return the TLS configuration for the host.
@@ -72,7 +77,7 @@ where
         .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(certs, PrivateKey(privkey.into()))
-        .map_err(|err| HostError::Tls(Error::RustTls(err)))?;
+        .map_err(Error::RustTls)?;
 
     debug!("config created: {:?}", config);
 
@@ -118,17 +123,14 @@ pub fn device_tls_config(ca_cert_file: Option<PathBuf>) -> Result<Connector, Dev
     let mut root_certs = RootCertStore::empty();
 
     if let Some(ca_cert_file) = ca_cert_file {
-        let file = std::fs::File::open(ca_cert_file)
-            .map_err(|err| DeviceError::Tls(Error::ReadFile(err)))?;
+        let file = std::fs::File::open(ca_cert_file).map_err(Error::ReadFile)?;
         let mut reader = BufReader::new(file);
 
-        for item in read_all(&mut reader).map_err(|err| DeviceError::Tls(Error::ReadFile(err)))? {
+        for item in read_all(&mut reader).map_err(Error::ReadFile)? {
             match item {
                 Item::X509Certificate(ca_cert) => {
                     let cert = Certificate(ca_cert);
-                    root_certs
-                        .add(&cert)
-                        .expect("failed to add CA cert to the root certs");
+                    root_certs.add(&cert).map_err(Error::RootCert)?
                 }
                 _ => return Err(DeviceError::Tls(Error::WrongItem)),
             }
@@ -160,7 +162,7 @@ pub async fn connect(
     let (ws_stream, _) = connect_async_tls_with_config(url, None, connector)
         .await
         .map_err(|err| {
-            tracing::error!(?err);
+            error!("error while connecting: {:?}", err);
             DeviceError::WebSocketConnect(err)
         })?;
 
@@ -173,19 +175,18 @@ pub async fn connect(
 /// It is responsible for the handling of a TLS connection.
 #[derive(Clone)]
 pub struct TlsService<S> {
-    service: S,
+    service: S, // TcpService
     acceptor: TlsAcceptor,
 }
 
-impl<S, Request, E> Service<Request> for TlsService<S>
+impl<'a, S> Service<&'a mut TcpListener> for TlsService<S>
 where
-    S: Service<TlsStream<Request>, Error = E> + Clone + 'static,
-    Request: AsyncWrite + AsyncRead + Unpin + 'static,
-    HostError: From<E>,
+    S: MakeConnection<&'a mut TcpListener, Connection = TcpStream, Future = TcpAccept<'a>>,
+    HostError: From<S::Error>,
 {
     type Error = HostError;
-    type Response = S::Response;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
+    type Response = TlsStream<S::Connection>;
+    type Future = TlsAccept<'a>;
 
     fn poll_ready(
         &mut self,
@@ -194,19 +195,54 @@ where
         self.service.poll_ready(cx).map_err(HostError::from)
     }
 
-    fn call(&mut self, req: Request) -> Self::Future {
-        let clone = self.service.clone();
-        // Acceptor is an Arc
-        let acceptor = self.acceptor.clone();
-        // take the service that was ready
-        let mut inner = std::mem::replace(&mut self.service, clone);
-        Box::pin(async move {
-            let stream = acceptor
-                .accept(req)
-                .await
-                .map_err(|err| HostError::Tls(Error::AcceptTls(err)))?;
-            inner.call(stream).await.map_err(HostError::from)
-        })
+    fn call(&mut self, req: &'a mut TcpListener) -> Self::Future {
+        TlsAccept {
+            either: Either::Left(TcpAccept { listener: req }),
+            acceptor: self.acceptor.clone(),
+        }
+    }
+}
+
+/// Future used to accept a Tls connection.
+pub struct TlsAccept<'a> {
+    // first accept a TCP connection and then create a TLS one over it.
+    either: Either<TcpAccept<'a>, Accept<TcpStream>>,
+    acceptor: TlsAcceptor,
+}
+
+impl<'a> Future for TlsAccept<'a> {
+    type Output = Result<TlsStream<TcpStream>, HostError>;
+
+    // this poll method is necessary to avoid incurring in a deadlock when locking
+    #[instrument(skip_all)]
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match &mut self.either {
+            Either::Left(tcp) => {
+                let stream = match ready!(tcp.poll_unpin(cx)) {
+                    Ok(tcp_stream) => tcp_stream,
+                    Err(err) => return Poll::Ready(Err(err)),
+                };
+
+                let accept = self.acceptor.accept(stream);
+
+                self.either = Either::Right(accept);
+
+                // update context so that EitherRight is executed
+                self.poll(cx)
+            }
+            Either::Right(tls) => {
+                let res =
+                    ready!(tls.poll_unpin(cx)).map_err(|err| HostError::Tls(Error::AcceptTls(err)));
+
+                match res {
+                    Ok(tls_stream) => Poll::Ready(Ok(tls_stream)),
+                    Err(err) => Poll::Ready(Err(err)),
+                }
+            }
+        }
     }
 }
 
@@ -231,18 +267,5 @@ impl<S> Layer<S> for TlsLayer {
             service: inner,
             acceptor: self.acceptor.clone(),
         }
-    }
-}
-
-impl HostBuilder<Stack<TlsLayer, Identity>> {
-    /// Add the [`TlsLayer`] on top of the tower stack and listen to a connection from a device.
-    pub async fn serve(self) -> Result<(), HostError> {
-        let (mut server, builder) = self.fields();
-        let service = builder
-            .layer(WebSocketLayer)
-            .layer(ProtocolLayer)
-            .service(HostService);
-
-        server.listen(service).await
     }
 }

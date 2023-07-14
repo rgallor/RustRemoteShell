@@ -9,7 +9,7 @@ use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
 use rust_remote_shell::device::Device;
-use rust_remote_shell::host::Host;
+use rust_remote_shell::host::{Host, HostError};
 
 /// CLI for a rust remote shell
 #[derive(Debug, Parser)]
@@ -24,8 +24,6 @@ enum Commands {
     /// Host waiting for a device connection
     Host {
         addr: SocketAddr,
-        #[clap(long, requires("host-cert-file"), requires("privkey-file"))]
-        tls_enabled: bool,
         #[clap(long)]
         host_cert_file: Option<PathBuf>,
         #[clap(long)]
@@ -34,8 +32,6 @@ enum Commands {
     /// Device capable of receiving commands from an host and sending output to it
     Device {
         device_cfg_path: String,
-        #[clap(long)]
-        tls_enabled: bool,
         #[clap(long)]
         ca_cert_file: Option<PathBuf>,
     },
@@ -57,29 +53,19 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Host {
             addr,
-            tls_enabled,
             host_cert_file,
             privkey_file,
         } => {
-            let builder = Host::bind(addr).await?;
+            let host = Host::bind(addr).await?;
 
-            if tls_enabled {
-                // retrieve certificates from the file names given in input and pass them as argument to with_tls()
-                let host_cert_file = host_cert_file.expect("host certificate must be inserted");
-                let privkey_file = privkey_file.expect("host certificate must be inserted");
+            #[cfg(feature = "tls")]
+            listen(host, host_cert_file, privkey_file).await?;
 
-                builder
-                    .with_tls(host_cert_file, privkey_file)
-                    .await?
-                    .serve()
-                    .await?;
-            } else {
-                builder.serve().await?;
-            }
+            #[cfg(not(feature = "tls"))]
+            listen(host).await?;
         }
         Commands::Device {
             device_cfg_path,
-            tls_enabled,
             ca_cert_file,
         } => {
             // To make comminicate a device with Astarte use the following command
@@ -88,13 +74,36 @@ async fn main() -> Result<()> {
 
             // TODO: at the moment we are using the same CA for different hosts, which is wrong.
             // SOLUTION: use astarte send_data to send the CA and retrieve it as an AstarteType of String's array.
-            if tls_enabled {
-                device.with_tls(ca_cert_file);
-            }
+            #[cfg(feature = "tls")]
+            device.with_tls(ca_cert_file);
 
             device.start().await?;
         }
     }
 
+    Ok(())
+}
+
+#[cfg(feature = "tls")]
+async fn listen(
+    host: Host,
+    host_cert_file: Option<PathBuf>,
+    privkey_file: Option<PathBuf>,
+) -> Result<(), HostError> {
+    // retrieve certificates from the file names given in input and pass them as arguments to with_tls()
+    let host_cert_file = host_cert_file.expect("host certificate must be inserted");
+    let privkey_file = privkey_file.expect("host certificate must be inserted");
+
+    host.with_tls(host_cert_file, privkey_file)
+        .await?
+        .listen()
+        .await?;
+
+    Ok(())
+}
+
+#[cfg(not(feature = "tls"))]
+async fn listen(host: Host) -> Result<(), HostError> {
+    host.listen().await?;
     Ok(())
 }

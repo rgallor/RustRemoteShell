@@ -2,7 +2,12 @@
 //!
 //! Module responsible for handling a connection between a Device and Astarte.
 
-use std::{collections::HashMap, fmt::Display, net::AddrParseError, num::TryFromIntError};
+use std::{
+    collections::HashMap,
+    fmt::Display,
+    net::{self, AddrParseError},
+    num::TryFromIntError,
+};
 
 use astarte_device_sdk::{
     options::{AstarteOptions, AstarteOptionsError},
@@ -11,7 +16,7 @@ use astarte_device_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{debug, instrument};
+use tracing::instrument;
 use url::Url;
 
 /// Astarte errors.
@@ -138,7 +143,7 @@ impl TryFrom<DataAggObject> for Url {
         let ip = match value.host {
             url::Host::Domain(domain) => domain,
             // Note: the IP 127.0.0.1 cannot be used due to a low MSRV, therefore the IP is converted to a domain name
-            url::Host::Ipv4(ipv4) if std::net::Ipv4Addr::LOCALHOST == ipv4 => {
+            url::Host::Ipv4(ipv4) if net::Ipv4Addr::LOCALHOST == ipv4 => {
                 "localhost.local".to_string()
             }
             host => host.to_string(),
@@ -151,12 +156,10 @@ impl TryFrom<DataAggObject> for Url {
 pub struct HandleAstarteConnection;
 
 impl HandleAstarteConnection {
-    /// Read the device configuration file and store the retrieved information.
+    /// Read the device configuration file.
     pub async fn read_device_config(&self, device_cfg_path: &str) -> Result<DeviceConfig, Error> {
-        let file = tokio::fs::read(device_cfg_path)
-            .await
-            .map_err(Error::ReadFile)?;
-        let file = std::str::from_utf8(&file).map_err(Error::Utf8Error)?;
+        let file = tokio::fs::read(device_cfg_path).await?;
+        let file = std::str::from_utf8(&file)?;
 
         let cfg: DeviceConfig = serde_json::from_str(file).map_err(|_| Error::Serde)?;
 
@@ -178,9 +181,7 @@ impl HandleAstarteConnection {
         .map_err(Error::AstarteInterface)?
         .ignore_ssl_errors();
 
-        let device = AstarteDeviceSdk::new(&sdk_options)
-            .await
-            .map_err(Error::AstarteCreateDevice)?;
+        let device = AstarteDeviceSdk::new(&sdk_options).await?;
 
         Ok(device)
     }
@@ -205,9 +206,8 @@ impl HandleAstarteConnection {
                 AstarteType::Integer(port),
             ) => {
                 let scheme = Scheme::try_from(scheme.as_ref())?;
-                let host = url::Host::parse(host).map_err(Error::Parse)?;
-                debug!("{:?}", host);
-                let port: u16 = (*port).try_into().map_err(Error::ParsePort)?;
+                let host = url::Host::parse(host)?;
+                let port: u16 = (*port).try_into()?;
 
                 DataAggObject { scheme, host, port }
             }

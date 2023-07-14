@@ -1,17 +1,11 @@
-//! Protocol used to describe the Host and Device actions after having established a connection.
+//! Protocol describing the Host and Device actions after a connection has been established.
 
-use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
-use tower::{Layer, Service};
+use tokio_tungstenite::tungstenite::Message;
 
-use crate::{
-    device::DeviceError,
-    host::{HandleConnection, HostError},
-};
+use crate::{device::DeviceError, host::HostError};
 
-/// Enum used to describe the actions a device can make.
+/// Enum used to describe the messages a host can send to a device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", content = "c")]
 pub enum HostMsg {
@@ -22,7 +16,7 @@ pub enum HostMsg {
         /// Command to execute.
         cmd: String,
     },
-    /// CTRL C
+    /// CTRL C signal sent
     Ctrlc,
 }
 
@@ -50,7 +44,7 @@ impl TryFrom<Message> for HostMsg {
     }
 }
 
-/// Enum used to describe the actions a host can make.
+/// Enum used to describe the messages a device can send to a host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", content = "c")]
 pub enum DeviceMsg {
@@ -67,49 +61,5 @@ impl TryFrom<DeviceMsg> for Message {
 
     fn try_from(value: DeviceMsg) -> Result<Self, Self::Error> {
         Ok(Message::Binary(bson::to_vec(&value)?))
-    }
-}
-
-/// Service introducing a protocol in the connection.
-#[derive(Clone)]
-pub struct ProtocolService<S> {
-    service: S,
-}
-
-/// Stream of [`DeviceMsg`] protocol messsages.
-pub type DeviceMsgStream = BoxStream<'static, Result<DeviceMsg, HostError>>;
-
-// receive a websocket stream
-impl<S, U> Service<WebSocketStream<U>> for ProtocolService<S>
-where
-    S: Service<HandleConnection<U>, Error = HostError> + Clone + 'static,
-    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    type Response = S::Response;
-    type Error = S::Error;
-    type Future = S::Future;
-
-    fn poll_ready(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        self.service.poll_ready(cx) // ready when the wrapping service is ready
-    }
-
-    fn call(&mut self, req: WebSocketStream<U>) -> Self::Future {
-        let handler = HandleConnection::new(req);
-
-        self.service.call(handler)
-    }
-}
-
-/// Protocol layer to be added in a [tower stack](tower::layer::util::Stack).
-pub struct ProtocolLayer;
-
-impl<S> Layer<S> for ProtocolLayer {
-    type Service = ProtocolService<S>;
-
-    fn layer(&self, inner: S) -> Self::Service {
-        ProtocolService { service: inner }
     }
 }
