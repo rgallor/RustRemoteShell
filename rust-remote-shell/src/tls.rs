@@ -41,8 +41,8 @@ use crate::websocket::TcpAccept;
 #[derive(Error, Debug)]
 pub enum Error {
     /// Error while loading digital certificate or private key.
-    #[error("Wrong item.")]
-    WrongItem,
+    #[error("Wrong item, {0}")]
+    WrongItem(String),
 
     /// Error while establishing a TLS connection.
     #[error("Error while establishing a TLS connection.")]
@@ -95,7 +95,11 @@ pub async fn acceptor(
     })?;
     let cert = match cert_item {
         Some(Item::X509Certificate(ca_cert)) => ca_cert,
-        _ => return Err(HostError::Tls(Error::WrongItem)),
+        _ => {
+            return Err(HostError::Tls(Error::WrongItem(
+                "host certificate".to_string(),
+            )))
+        }
     };
 
     let privkey_item = retrieve_item(&privkey_file).map_err(|err| HostError::ReadFile {
@@ -104,7 +108,7 @@ pub async fn acceptor(
     })?;
     let privkey = match privkey_item {
         Some(Item::PKCS8Key(privkey)) => privkey,
-        _ => return Err(HostError::Tls(Error::WrongItem)),
+        _ => return Err(HostError::Tls(Error::WrongItem("private key".to_string()))),
     };
 
     let acceptor = TlsAcceptor::from(Arc::new(host_tls_config(cert, privkey).await?));
@@ -132,7 +136,11 @@ pub fn device_tls_config(ca_cert_file: Option<PathBuf>) -> Result<Connector, Dev
                     let cert = Certificate(ca_cert);
                     root_certs.add(&cert).map_err(Error::RootCert)?
                 }
-                _ => return Err(DeviceError::Tls(Error::WrongItem)),
+                _ => {
+                    return Err(DeviceError::Tls(Error::WrongItem(
+                        "CA certificate".to_string(),
+                    )))
+                }
             }
         }
     };

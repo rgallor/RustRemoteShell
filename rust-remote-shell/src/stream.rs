@@ -26,7 +26,7 @@ use tokio::{
     sync::{Mutex, MutexGuard},
 };
 use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
-use tracing::{info, instrument};
+use tracing::info;
 
 use crate::{host::HostError, protocol::DeviceMsg};
 
@@ -89,17 +89,6 @@ where
     ) -> MutexGuard<'_, impl Sink<Message, Error = <WebSocketStream<S> as Sink<Message>>::Error>>
     {
         self.inner.ws_stream.lock().await
-    }
-
-    /// Consume the elements of the stream.
-    #[instrument(skip_all)]
-    pub(crate) async fn empty_stream(&mut self) -> Result<(), HostError> {
-        while let Some(res) = self.next().await {
-            // propagate the error
-            res?;
-        }
-
-        Ok(())
     }
 }
 

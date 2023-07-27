@@ -98,7 +98,7 @@ pub enum DeviceError {
 
     /// TLS error
     #[cfg(feature = "tls")]
-    #[error("Wrong item.")]
+    #[error("Tls error")]
     Tls(#[from] TlsError),
 }
 

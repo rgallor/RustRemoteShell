@@ -115,7 +115,7 @@ pub enum HostError {
 
     /// TLS error
     #[cfg(feature = "tls")]
-    #[error("Wrong item.")]
+    #[error("Tls error")]
     Tls(#[from] TlsError),
 }
 
@@ -128,26 +128,18 @@ impl HostError {
             HostError::WebSocketConnect(TungError::Protocol(
                 ProtocolError::ResetWithoutClosingHandshake,
             )) => {
-                info!("Closing websocket connection due to device interruption");
+                error!("Closing websocket connection due to device interruption");
                 Err(HostError::Exit)
             }
             HostError::WebSocketConnect(TungError::Io(err))
                 if err.kind() == io::ErrorKind::UnexpectedEof =>
             {
-                info!("Connection reset by peer");
+                error!("Connection reset by peer");
                 Err(HostError::Exit)
             }
             HostError::TungsteniteReadData(_) => {
                 info!("Connection closed normally");
                 Err(HostError::Exit)
-            }
-            #[cfg(feature = "tls")]
-            HostError::Tls(tls_err @ TlsError::AcceptTls(_)) => {
-                error!("Connection discarded due to tls error: {}", tls_err);
-                Ok(format!(
-                    "Connection discarded due to tls error: {}",
-                    tls_err
-                ))
             }
             err => Err(err),
         }
@@ -288,7 +280,15 @@ impl Host {
                 }
                 // create a new connection and use cmd_handler to handle shell commands
                 cmd_handler = service.make_service(&mut self.listener) => {
-                    let mut cmd_handler = cmd_handler?;
+                    let mut cmd_handler = match cmd_handler {
+                        Ok(cmd_handler) => cmd_handler,
+                        #[cfg(feature = "tls")]
+                        Err(HostError::Tls(tls_err @ TlsError::AcceptTls(_))) => {
+                            error!("Connection discarded due to tls error: {}", tls_err);
+                            continue;
+                        }
+                        Err(err) => return Err(err),
+                    };
 
                     loop {
                         select! {
