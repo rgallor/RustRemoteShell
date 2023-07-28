@@ -1,12 +1,10 @@
-use clap::{Parser, Subcommand};
-
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use clap::{Parser, Subcommand};
 use color_eyre::Result;
-
-use tracing::Level;
-use tracing_subscriber::FmtSubscriber;
+use tracing_subscriber::filter::EnvFilter;
+use tracing_subscriber::prelude::*;
 
 use rust_remote_shell::device::Device;
 use rust_remote_shell::host::{Host, HostError};
@@ -41,12 +39,10 @@ enum Commands {
 async fn main() -> Result<()> {
     color_eyre::install()?;
 
-    // tracing subscriber for logging
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::TRACE)
-        .finish();
-
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(EnvFilter::from_default_env())
+        .try_init()?;
 
     let cli = Cli::parse();
 
