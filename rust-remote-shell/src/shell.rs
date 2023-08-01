@@ -29,10 +29,6 @@ pub enum ShellError {
         err: io::Error,
     },
 
-    /// Error while retrieving stdout from child process.
-    #[error("Error while retrieving stdout from child process.")]
-    RetrieveStdout,
-
     /// Error while chilling child process.
     #[error("Error while killing child process.")]
     KillChild(#[from] io::Error),
@@ -83,10 +79,10 @@ impl CommandHandler {
         let stdout = self
             .child
             .as_mut()
-            .unwrap() // it has certainly been initialized
+            .expect("Child has certainly been initialized")
             .stdout
             .take()
-            .ok_or(ShellError::RetrieveStdout)?;
+            .expect("CHildStdout will always be initialized with Some(val), so take() method can be called");
 
         Ok(stdout)
     }
@@ -104,5 +100,42 @@ impl CommandHandler {
         let mut child = self.child.take().ok_or(ShellError::NoCommand)?;
         child.kill().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::AsyncReadExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_execute() {
+        // test correct input
+        let cmd = String::from("echo ciao");
+        let mut cmd_handler = CommandHandler::default();
+        let mut res = cmd_handler.execute(cmd).expect("should have returned Ok");
+        let mut cmd_out = String::new();
+        let _bytes = res.read_to_string(&mut cmd_out).await.unwrap();
+
+        let exp_res = "ciao\n".to_string();
+
+        assert_eq!(cmd_out, exp_res);
+
+        // test Malformed input
+        let cmd = String::from("echo 'MALFORMED INPUT`");
+        let mut cmd_handler = CommandHandler::default();
+        let res = cmd_handler.execute(cmd);
+
+        assert!(matches!(res, Err(ShellError::MalformedInput)));
+
+        // test empty command
+        let cmd = String::from("\n");
+        let mut cmd_handler = CommandHandler::default();
+        let res = cmd_handler.execute(cmd);
+
+        assert!(matches!(res, Err(ShellError::EmptyCommand)));
+
+        // TODO: test CreateChild error
     }
 }

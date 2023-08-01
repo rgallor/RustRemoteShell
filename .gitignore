@@ -17,3 +17,5 @@ target/
 .DS_Store
 
 .vscode/
+
+tarpaulin-report.html
