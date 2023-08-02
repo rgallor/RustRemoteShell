@@ -9,6 +9,7 @@ use std::fmt::Debug;
 
 use std::io;
 use std::net::SocketAddr;
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -19,7 +20,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 
 use tokio::sync::mpsc::error::SendError;
-use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::{select, signal};
@@ -106,6 +107,10 @@ pub enum HostError {
     #[error("Unexpected EoF.")]
     UnexpectedEof,
 
+    /// State errors
+    #[error("State error, {0}")]
+    State(String),
+
     /// Exit command received.
     ///
     /// This error variant doesn't represent a real error.
@@ -123,25 +128,150 @@ impl HostError {
     /// Method used to handle errors causing the closure of the underlying WebSocket connection
     /// between the host and and Astarte device. It returns a [`Exit`](HostError::Exit) error in case
     /// the connection should be gracefully closed, otherwise it returns the original error.
-    pub(crate) fn handle_close(self) -> Result<String, Self> {
+    pub(crate) fn is_fatal(&self) -> bool {
         match self {
             HostError::WebSocketConnect(TungError::Protocol(
                 ProtocolError::ResetWithoutClosingHandshake,
             )) => {
                 error!("Closing websocket connection due to device interruption");
-                Err(HostError::Exit)
+                false
             }
             HostError::WebSocketConnect(TungError::Io(err))
                 if err.kind() == io::ErrorKind::UnexpectedEof =>
             {
                 error!("Connection reset by peer");
-                Err(HostError::Exit)
+                false
             }
             HostError::TungsteniteReadData(_) => {
                 info!("Connection closed normally");
-                Err(HostError::Exit)
+                false
             }
-            err => Err(err),
+            _ => true,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Event<U> {
+    Connection(CommandService<U>),
+    Command(Option<String>),
+    Ctrlc,
+}
+
+struct State<'a, S, U> {
+    service: HostService<WebSocketService<S>>,
+    ctrlc_notify: Arc<Notify>,
+    listener: &'a mut TcpListener,
+    rx_cmd: Receiver<String>,
+    cmd_handler: Option<CommandService<U>>,
+}
+
+impl<'a, S, U> State<'a, S, U>
+where
+    S: for<'b> MakeConnection<&'b mut TcpListener, Connection = U, Error = HostError>
+        + Clone
+        + 'static,
+    U: AsyncRead + AsyncWrite + Unpin + 'static,
+{
+    fn init(
+        service: HostService<WebSocketService<S>>,
+        ctrlc_notify: Arc<Notify>,
+        listener: &'a mut TcpListener,
+        rx_cmd: Receiver<String>,
+    ) -> Self {
+        Self {
+            service,
+            ctrlc_notify,
+            listener,
+            rx_cmd,
+            cmd_handler: None,
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn handle_event(&mut self) -> Result<ControlFlow<()>, HostError> {
+        let event = self.next_event().await?;
+
+        // TODO: add log
+        match event {
+            Event::Connection(cmd_handler) => {
+                self.cmd_handler.replace(cmd_handler);
+            }
+            Event::Command(Some(cmd)) => match &mut self.cmd_handler {
+                Some(cmd_handler) => {
+                    let ctrlf = cmd_handler.call(cmd).await?;
+                    if ctrlf.is_break() {
+                        self.cmd_handler.take();
+                    }
+                } // return ControlFlow
+                None => {
+                    error!("Command received without connection established");
+                }
+            },
+            // CTRL D (input closed, EoF)
+            Event::Command(None) => match &mut self.cmd_handler {
+                Some(cmd_handler) => {
+                    cmd_handler.close().await?;
+                    self.cmd_handler.take();
+                }
+                None => {
+                    error!("EoF received without connection established");
+                }
+            },
+            Event::Ctrlc => match &mut self.cmd_handler {
+                Some(cmd_handler) => {
+                    cmd_handler.close().await?;
+                    self.cmd_handler.take();
+                }
+                None => return Ok(ControlFlow::Break(())),
+            },
+        }
+
+        Ok(ControlFlow::Continue(()))
+    }
+
+    #[instrument(skip_all)]
+    async fn next_event(&mut self) -> Result<Event<U>, HostError> {
+        match self.cmd_handler {
+            None => self.await_connection().await,
+            Some(_) => Ok(self.await_command().await),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn await_connection(&mut self) -> Result<Event<U>, HostError> {
+        select! {
+            _ = self.ctrlc_notify.notified() => {
+                info!("CTRL C received while waiting for a connection, terminating the host.");
+                Ok(Event::Ctrlc)
+            }
+            // create a new connection and use cmd_handler to handle shell commands
+            cmd_handler = self.service.make_service(self.listener) => {
+                match cmd_handler {
+                    Ok(cmd_handler) => Ok(Event::Connection(cmd_handler)),
+                    #[cfg(feature = "tls")]
+                    Err(HostError::Tls(tls_err @ TlsError::AcceptTls(_))) => {
+                        error!("Connection discarded due to tls error: {}", tls_err);
+                        Err(HostError::Tls(tls_err))
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn await_command(&mut self) -> Event<U> {
+        select! {
+            // CTRL C received
+            _ = self.ctrlc_notify.notified() => {
+                info!("CTRL C received while waiting for a command to be executed, closing the connection and waiting for a new one.");
+                Event::Ctrlc
+            }
+            // receive a string (command) from the stdin task
+            cmd = self.rx_cmd.recv() => {
+                Event::Command(cmd.filter(|cmd| !cmd.is_empty()))
+            }
         }
     }
 }
@@ -181,7 +311,7 @@ impl Host {
     /// This function define a [`tower`] service (built using different tower Layers)
     /// and start listenning in loop for new connections from devices.
     #[instrument(skip_all)]
-    pub async fn listen(mut self) -> Result<(), HostError> {
+    pub async fn listen(self) -> Result<(), HostError> {
         // define a Notify used to notify tasks when a CTRL C is sent
         let ctrlc_notify = Arc::new(Notify::new());
 
@@ -207,7 +337,7 @@ impl Host {
 
     #[cfg(feature = "tls")]
     async fn listen_result(
-        &mut self,
+        mut self,
         builder: ServiceBuilder<Stack<WebSocketLayer, Stack<HostLayer, Identity>>>,
         ctrlc_notify: Arc<Notify>,
     ) -> Result<(), HostError> {
@@ -226,7 +356,7 @@ impl Host {
 
     #[cfg(not(feature = "tls"))]
     async fn listen_result(
-        &mut self,
+        mut self,
         builder: ServiceBuilder<Stack<WebSocketLayer, Stack<HostLayer, Identity>>>,
         ctrlc_notify: Arc<Notify>,
     ) -> Result<(), HostError> {
@@ -255,8 +385,8 @@ impl Host {
     /// to send shell command to the device and handle its responses.
     #[instrument(skip_all)]
     async fn listen_loop<S, U>(
-        &mut self,
-        mut service: HostService<WebSocketService<S>>,
+        mut self,
+        service: HostService<WebSocketService<S>>,
         ctrlc_notify: Arc<Notify>,
     ) -> Result<(), HostError>
     where
@@ -265,66 +395,17 @@ impl Host {
             + 'static,
         U: AsyncRead + AsyncWrite + Unpin + 'static,
     {
-        let (tx_stdin, mut rx_stdin) = channel(1);
+        let (tx_cmd, rx_cmd) = channel(1);
 
         // task responsible for handling stdin
-        let handle_stdio = tokio::task::spawn_blocking(move || Self::stdin_handler(tx_stdin));
+        let handle_stdio = tokio::task::spawn_blocking(move || Self::stdin_handler(tx_cmd));
 
-        loop {
-            select! {
-                _ = ctrlc_notify.notified() => {
-                    info!("CTRL C received while waiting for a connection, terminating the host.");
-                    handle_stdio.abort();
-                    // this is necessary to stop reading from stdin if the task is blocking
-                    std::process::exit(0);
-                }
-                // create a new connection and use cmd_handler to handle shell commands
-                cmd_handler = service.make_service(&mut self.listener) => {
-                    let mut cmd_handler = match cmd_handler {
-                        Ok(cmd_handler) => cmd_handler,
-                        #[cfg(feature = "tls")]
-                        Err(HostError::Tls(tls_err @ TlsError::AcceptTls(_))) => {
-                            error!("Connection discarded due to tls error: {}", tls_err);
-                            continue;
-                        }
-                        Err(err) => return Err(err),
-                    };
+        let mut state = State::init(service, ctrlc_notify, &mut self.listener, rx_cmd);
 
-                    loop {
-                        select! {
-                            // CTRL C received
-                            _ = ctrlc_notify.notified() => {
-                                info!("CTRL C received while waiting for a command to be executed, closing the connection and waiting for a new one.");
-                                Self::ctrl_c_close(cmd_handler, &handle_stdio).await?;
-                                break;
-                            }
-                            // receive a string (command) from the stdin task
-                            res = rx_stdin.recv() => {
-                                if let Some(cmd) = res {
-                                    // CTRL D (0 bytes read) -> close connection
-                                    if cmd.is_empty() {
-                                        info!("CTRL D received");
-                                        Self::ctrl_c_close(cmd_handler, &handle_stdio).await?;
-                                        break;
-                                    }
+        while let ControlFlow::Continue(()) = state.handle_event().await? {}
 
-                                    // handle command using call() function of CommandService
-                                    match cmd_handler.call(cmd).await {
-                                        Ok(()) => {},
-                                        Err(HostError::Exit) => {
-                                            info!("waiting to receive a new connection");
-                                            break;
-                                        },
-
-                                        Err(err) => return Err(err),
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        handle_stdio.abort();
+        std::process::exit(0);
     }
 
     /// Endless stdin read.
@@ -336,19 +417,6 @@ impl Host {
             stdin.read_line(&mut buf).map_err(HostError::IORead)?;
             tx_stdin.blocking_send(buf)?; // HostError::ChannelCmd
         }
-    }
-
-    /// Close the connection and abort the task responsible for handling stdin read.
-    async fn ctrl_c_close<U>(
-        cmd_handler: CommandService<U>,
-        handle_stdio: &JoinHandle<Result<(), HostError>>,
-    ) -> Result<(), HostError>
-    where
-        U: AsyncRead + AsyncWrite + Unpin + 'static,
-    {
-        cmd_handler.close().await?;
-        handle_stdio.abort();
-        Ok(())
     }
 }
 

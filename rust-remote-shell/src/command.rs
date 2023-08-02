@@ -5,7 +5,7 @@
 //! * handling CTRL C and CTRL D signals,
 //! * closing an openned WebSocket connection with a device.
 
-use std::{sync::Arc, task::Poll};
+use std::{ops::ControlFlow, sync::Arc, task::Poll};
 
 use futures::{future::LocalBoxFuture, FutureExt, SinkExt, StreamExt};
 use tokio::{
@@ -44,7 +44,7 @@ impl<S> Service<String> for CommandService<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + 'static,
 {
-    type Response = ();
+    type Response = ControlFlow<()>;
     type Error = HostError;
     type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
 
@@ -82,29 +82,16 @@ where
 
     /// Command execution handler.
     #[instrument(skip(self))]
-    async fn handle_command(self, cmd: String) -> Result<(), HostError> {
+    async fn handle_command(self, cmd: String) -> Result<ControlFlow<()>, HostError> {
         match self.impl_handle_command(cmd).await {
-            Ok(()) => Ok(()),
-            Err(err) => match err.handle_close() {
-                Ok(msg) => {
-                    info!("{}", msg);
-                    Ok(())
-                }
-                Err(err @ HostError::Exit) => {
-                    info!("Closing connection");
-                    Err(err)
-                }
-                Err(err) => {
-                    error!("Fatal error: {}", err);
-                    eprintln!("{:#?}", err);
-                    Err(err)
-                }
-            },
+            Ok(ctrlf) => Ok(ctrlf),
+            Err(err) if !err.is_fatal() => Ok(ControlFlow::Break(())),
+            Err(err) => Err(err),
         }
     }
 
     #[instrument(skip_all)]
-    async fn impl_handle_command(mut self, cmd: String) -> Result<(), HostError> {
+    async fn impl_handle_command(mut self, cmd: String) -> Result<ControlFlow<()>, HostError> {
         // Steps:
         // 1. send command to device
         // 2. loop
@@ -117,7 +104,7 @@ where
             // termination condition when calling this method in a loop
             debug!("command \"exit\" received");
             self.close().await?;
-            return Err(HostError::Exit);
+            return Ok(ControlFlow::Break(()));
         }
 
         let msg = HostMsg::Command { cmd };
@@ -134,13 +121,13 @@ where
             select! {
                 _ = self.ctrl_c.notified() => {
                     self.handle_ctrl_c_notify().await?;
-                    return Ok(());
+                    return Ok(ControlFlow::Continue(()));
                 }
 
                 msg = self.msg_handler.next() => {
                     let stop_loop = self.handle_incoming_msg(msg).await?;
                     if stop_loop {
-                        return Ok(());
+                        return Ok(ControlFlow::Continue(()));
                     }
                 }
             }
